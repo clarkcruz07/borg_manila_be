@@ -1,0 +1,390 @@
+const express = require("express");
+const multer = require("multer");
+const fs = require("fs");
+const crypto = require("crypto");
+const { extractText } = require("../services/ocr");
+const { analyzeReceiptText, analyzeReceiptImage } = require("../services/gemini");
+const { verifyToken } = require("../middleware/auth");
+const Receipt = require("../models/Receipt");
+const Employee = require("../models/Employee");
+const { saveReceiptAsJPG, createFolderStructureAsync } = require("../services/fileManager");
+const { cleanExtractedData } = require("../services/textCleaner");
+
+const router = express.Router();
+const upload = multer({ dest: "uploads/" });
+
+function normalizeMonthYearKey(dateStr) {
+  if (!dateStr || typeof dateStr !== "string") return null;
+  const d = new Date(dateStr);
+  if (Number.isNaN(d.getTime())) return null;
+  // YYYY-MM format for month-year grouping
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  return `${yyyy}-${mm}`;
+}
+
+// Generate SHA-256 hash of file for duplicate detection
+function computeFileHash(filePath) {
+  try {
+    const fileBuffer = fs.readFileSync(filePath);
+    return crypto.createHash("sha256").update(fileBuffer).digest("hex");
+  } catch (err) {
+    console.error("Error computing file hash:", err);
+    return null;
+  }
+}
+
+// Generate receipt fingerprint from extracted data
+// Uses: TIN + normalized date + normalized amount + shop name
+function generateReceiptKey(extracted) {
+  if (!extracted) return null;
+  
+  // Normalize and clean TIN (remove all non-alphanumeric except dashes, then remove dashes)
+  const tin = (extracted.tinNumber || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9-]/g, "")
+    .replace(/-/g, "")
+    .replace(/\s+/g, "");
+  
+  // Normalize shop name (lowercase, remove extra spaces)
+  const shop = (extracted.shopName || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[^\w\s]/g, "");
+  
+  // Normalize date to YYYY-MM-DD format - handle various date formats
+  let dateNormalized = "";
+  if (extracted.date) {
+    try {
+      // Try parsing the date string (handles formats like "September 14, 2025")
+      const d = new Date(extracted.date);
+      if (!Number.isNaN(d.getTime()) && d.getFullYear() > 2000 && d.getFullYear() < 2100) {
+        const yyyy = d.getFullYear();
+        const mm = String(d.getMonth() + 1).padStart(2, "0");
+        const dd = String(d.getDate()).padStart(2, "0");
+        dateNormalized = `${yyyy}-${mm}-${dd}`;
+      }
+    } catch (err) {
+      console.error("Date parsing error:", err, "for date:", extracted.date);
+    }
+  }
+  
+  // Normalize amount (remove currency symbols, spaces, commas, keep only digits and decimal)
+  const amount = (extracted.amountDue || "")
+    .replace(/[₱$,\s]/g, "")
+    .replace(/[^\d.]/g, "")
+    .trim();
+  
+  // Create fingerprint string - use empty string if field is missing
+  const fingerprint = `${tin}|${dateNormalized}|${amount}|${shop}`;
+  
+  // Only generate key if we have at least TIN or amount (minimum required for duplicate detection)
+  if (!tin && !amount) {
+    console.warn("Cannot generate receiptKey: missing both TIN and amount", extracted);
+    return null;
+  }
+  
+  // Return SHA-256 hash of fingerprint
+  return crypto.createHash("sha256").update(fingerprint).digest("hex");
+}
+
+// Protected receipt upload – requires valid JWT token
+router.post("/upload", verifyToken, upload.single("receipt"), async (req, res) => {
+  try {
+    // Create an AbortController to track request cancellation
+    const abortController = new AbortController();
+    
+    // Listen for client disconnect
+    req.on('close', () => {
+      if (!res.headersSent) {
+        console.log('Client disconnected, aborting OCR processing...');
+        abortController.abort();
+      }
+    });
+
+    // Use OCR method first (free and works for most receipts)
+    console.log("Analyzing receipt with OCR...");
+    const ocrText = await extractText(req.file.path, abortController.signal);
+    const extracted = await analyzeReceiptText(ocrText);
+    
+    // Clean the extracted data to fix common OCR mistakes
+    const cleanedExtracted = cleanExtractedData(extracted);
+    
+    console.log("OCR Text:", ocrText);
+    console.log("Extracted (cleaned):", cleanedExtracted);
+    
+    // No folder creation here - only happens when saving to database
+    res.json({
+      filePath: req.file.path, // Temporary path - will be converted to JPG on save
+      originalName: req.file.originalname,
+      extracted: cleanedExtracted
+    });
+  } catch (err) {
+    // Don't log error if request was aborted
+    if (err.message === 'Request aborted') {
+      console.log("Receipt upload aborted by client");
+      // Clean up uploaded file
+      if (req.file?.path && fs.existsSync(req.file.path)) {
+        fs.unlinkSync(req.file.path);
+      }
+      return; // Don't send response, client already disconnected
+    }
+    
+    console.error("UPLOAD ERROR:", err);
+    res.status(500).json({
+      error: err.message,
+      stack: err.stack
+    });
+  }
+});
+
+// Save uploaded receipt + extracted fields to DB (protected)
+router.post("/", verifyToken, async (req, res) => {
+  try {
+    const { filePath, originalName, extracted } = req.body;
+
+    if (!filePath) {
+      return res.status(400).json({ error: "filePath is required" });
+    }
+
+    // Generate receipt fingerprint for same-receipt detection (check before conversion)
+    const receiptKey = generateReceiptKey(extracted);
+
+    console.log("Duplicate check - receiptKey:", receiptKey ? receiptKey.substring(0, 16) + "..." : "null");
+    console.log("Duplicate check - extracted:", JSON.stringify(extracted, null, 2));
+
+    // Check for duplicate receipt (same receipt data, different photo) - do this BEFORE conversion
+    if (receiptKey) {
+      const duplicateReceipt = await Receipt.findOne({
+        userId: req.user.userId,
+        receiptKey,
+      });
+      
+      if (duplicateReceipt) {
+        console.log("Duplicate receipt detected:", duplicateReceipt._id);
+        return res.status(409).json({
+          error: "Duplicate receipt detected: A receipt with the same details (TIN, date, amount, shop) already exists",
+        });
+      }
+    }
+
+    // Convert to JPG and save to employee folder structure
+    // This happens synchronously but folder creation was already started in background
+    const jpgFilePath = await saveReceiptAsJPG(filePath, req.user.userId, extracted?.date, Employee);
+    
+    // Compute file hash for exact duplicate detection (on the JPG file)
+    const jpgFileHash = computeFileHash(jpgFilePath);
+    
+    // Check for duplicate file (exact same file uploaded) - after conversion
+    if (jpgFileHash) {
+      const duplicateFile = await Receipt.findOne({
+        userId: req.user.userId,
+        fileHash: jpgFileHash,
+      });
+      
+      if (duplicateFile) {
+        console.log("Duplicate file detected:", duplicateFile._id);
+        // Clean up the JPG file we just created (use promises API)
+        fs.promises
+          .unlink(jpgFilePath)
+          .catch(err => console.warn("Could not delete duplicate JPG:", err));
+        return res.status(409).json({
+          error: "Duplicate receipt detected: This exact file has already been uploaded",
+        });
+      }
+    }
+    
+    if (!receiptKey) {
+      // If receiptKey is null, do a fallback check using actual field values
+      // This handles cases where date parsing fails but we still have TIN + amount
+      const tin = (extracted?.tinNumber || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+      const amount = (extracted?.amountDue || "").replace(/[₱$,\s]/g, "").replace(/[^\d.]/g, "").trim();
+      
+      if (tin && amount) {
+        // Check for existing receipt with same TIN and amount (within same month)
+        const monthYearKey = normalizeMonthYearKey(extracted?.date) || normalizeMonthYearKey(new Date().toISOString());
+        const existingReceipt = await Receipt.findOne({
+          userId: req.user.userId,
+          monthYearKey,
+          "extracted.tinNumber": { $regex: new RegExp(tin.replace(/[^A-Z0-9]/g, ""), "i") },
+          "extracted.amountDue": { $regex: new RegExp(amount, "i") },
+        });
+        
+        if (existingReceipt) {
+          console.log("Duplicate receipt detected (fallback check):", existingReceipt._id);
+          // Clean up the JPG file we just created (use promises API)
+          fs.promises
+            .unlink(jpgFilePath)
+            .catch(err => console.warn("Could not delete duplicate JPG:", err));
+          return res.status(409).json({
+            error: "Duplicate receipt detected: A receipt with the same TIN and amount already exists",
+          });
+        }
+      }
+    }
+
+    const monthYearKey =
+      normalizeMonthYearKey(extracted?.date) ||
+      normalizeMonthYearKey(new Date().toISOString());
+
+    // Ensure receiptKey is not null - if it is, generate a fallback key
+    let finalReceiptKey = receiptKey;
+    if (!finalReceiptKey) {
+      // Fallback: use TIN + amount + shop if available
+      const tin = (extracted?.tinNumber || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+      const amount = (extracted?.amountDue || "").replace(/[₱$,\s]/g, "").replace(/[^\d.]/g, "").trim();
+      const shop = (extracted?.shopName || "").trim().toLowerCase().replace(/\s+/g, "");
+      if (tin || amount) {
+        const fallbackFingerprint = `${tin}|${amount}|${shop}`;
+        finalReceiptKey = crypto.createHash("sha256").update(fallbackFingerprint).digest("hex");
+      }
+    }
+
+    const receipt = await Receipt.create({
+      userId: req.user.userId,
+      filePath: jpgFilePath, // Now points to JPG in organized folder
+      originalName: originalName || null,
+      extracted: {
+        shopName: extracted?.shopName ?? null,
+        tinNumber: extracted?.tinNumber ?? null,
+        amountDue: extracted?.amountDue ?? null,
+        address: extracted?.address ?? null,
+        date: extracted?.date ?? null,
+      },
+      monthYearKey,
+      fileHash: jpgFileHash || null, // Use JPG file hash
+      receiptKey: finalReceiptKey || null,
+    });
+
+    console.log("Receipt saved successfully as JPG:", receipt._id, "at", jpgFilePath);
+    res.status(201).json(receipt);
+  } catch (err) {
+    console.error("RECEIPT SAVE ERROR:", err);
+    
+    // Handle MongoDB duplicate key error
+    if (err.code === 11000) {
+      return res.status(409).json({
+        error: "Duplicate receipt detected: This receipt already exists in your records",
+      });
+    }
+    
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get my saved receipts (protected)
+router.get("/", verifyToken, async (req, res) => {
+  try {
+    const receipts = await Receipt.find({ userId: req.user.userId })
+      .sort({ monthYearKey: -1, createdAt: -1 })
+      .lean();
+
+    // Convert absolute paths to relative paths for frontend
+    const receiptsWithRelativePaths = receipts.map(receipt => ({
+      ...receipt,
+      filePath: receipt.filePath ? receipt.filePath.replace(/\\/g, "/").split("uploads/")[1] : null
+    }));
+
+    res.json({ total: receiptsWithRelativePaths.length, receipts: receiptsWithRelativePaths });
+  } catch (err) {
+    console.error("RECEIPT LIST ERROR:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Manager endpoint: Get all receipts with date filtering (role 1 only)
+router.get("/manager/all", verifyToken, async (req, res) => {
+  try {
+    // Check if user is Manager (role 1)
+    if (req.user.role !== 1) {
+      return res.status(403).json({ error: "Access denied: Manager role required" });
+    }
+
+    const { startDate, endDate } = req.query;
+
+    if (!startDate || !endDate) {
+      return res.status(400).json({ error: "Start date and end date are required" });
+    }
+
+    // Build query to filter by date
+    const query = {};
+    
+    // Filter by extracted date (parse the date string from extracted.date)
+    // We'll do a simple text comparison since dates are stored as strings
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    end.setHours(23, 59, 59, 999); // Include the entire end date
+
+    // Find all receipts and filter by parsed date
+    const allReceipts = await Receipt.find({})
+      .populate({
+        path: "userId",
+        select: "email"
+      })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Filter receipts by date range
+    const filteredReceipts = allReceipts.filter(receipt => {
+      if (!receipt.extracted?.date) return false;
+      
+      try {
+        const receiptDate = new Date(receipt.extracted.date);
+        return receiptDate >= start && receiptDate <= end;
+      } catch (err) {
+        return false;
+      }
+    });
+
+    // Populate user names from Employee collection
+    const receiptsWithUserInfo = await Promise.all(
+      filteredReceipts.map(async (receipt) => {
+        try {
+          const employee = await Employee.findOne({ userId: receipt.userId?._id });
+          
+          // Convert absolute path to relative path for frontend
+          const relativePath = receipt.filePath 
+            ? receipt.filePath.replace(/\\/g, "/").split("uploads/")[1] 
+            : null;
+          
+          return {
+            ...receipt,
+            filePath: relativePath,
+            userId: {
+              _id: receipt.userId?._id,
+              email: receipt.userId?.email,
+              firstName: employee?.firstName || "Unknown",
+              lastName: employee?.lastName || "User",
+            }
+          };
+        } catch (err) {
+          return {
+            ...receipt,
+            filePath: receipt.filePath 
+              ? receipt.filePath.replace(/\\/g, "/").split("uploads/")[1] 
+              : null,
+            userId: {
+              _id: receipt.userId?._id,
+              email: receipt.userId?.email,
+              firstName: "Unknown",
+              lastName: "User",
+            }
+          };
+        }
+      })
+    );
+
+    res.json({
+      total: receiptsWithUserInfo.length,
+      receipts: receiptsWithUserInfo
+    });
+  } catch (err) {
+    console.error("MANAGER RECEIPT LIST ERROR:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+module.exports = router;
