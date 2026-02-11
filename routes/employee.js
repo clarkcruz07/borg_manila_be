@@ -70,6 +70,8 @@ router.post("/profile", verifyToken, async (req, res) => {
       position,
       company,
       department,
+      dateHired,
+      profilePicture,
       sssNumber,
       philhealthNumber,
       tinNumber,
@@ -111,6 +113,8 @@ router.post("/profile", verifyToken, async (req, res) => {
       employee.position = position;
       employee.company = company;
       employee.department = department;
+      employee.dateHired = dateHired || employee.dateHired;
+      if (profilePicture) employee.profilePicture = profilePicture;
       employee.sssNumber = sssNumber || "";
       employee.philhealthNumber = philhealthNumber || "";
       employee.tinNumber = tinNumber || "";
@@ -123,6 +127,9 @@ router.post("/profile", verifyToken, async (req, res) => {
       } else {
         employee.approval_status = 0;
       }
+      
+      // Clear rejection reason when resubmitting
+      employee.rejectionReason = undefined;
 
       employee.updatedAt = Date.now();
     } else {
@@ -141,6 +148,8 @@ router.post("/profile", verifyToken, async (req, res) => {
         position,
         company,
         department,
+        dateHired,
+        profilePicture,
         sssNumber: sssNumber || "",
         philhealthNumber: philhealthNumber || "",
         tinNumber: tinNumber || "",
@@ -198,7 +207,7 @@ router.patch("/profile/:employeeId/approve", verifyToken, ensureCanApprove, asyn
   try {
     const { approval_status } = req.body;
 
-    if (approval_status === undefined || ![0, 1].includes(approval_status)) {
+    if (approval_status === undefined || ![-1, 0, 1].includes(approval_status)) {
       return res.status(400).json({ error: "Invalid approval status" });
     }
 
@@ -231,11 +240,64 @@ router.patch("/profile/:employeeId/approve", verifyToken, ensureCanApprove, asyn
     }
 
     employee.approval_status = approval_status;
+    
+    // Clear rejection reason if approving
+    if (approval_status === 1) {
+      employee.rejectionReason = undefined;
+    }
+    
     employee.updatedAt = Date.now();
     await employee.save();
 
     res.json({
       message: "Approval status updated",
+      employee,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Reject employee profile with reason
+router.patch("/profile/:employeeId/reject", verifyToken, ensureCanApprove, async (req, res) => {
+  try {
+    const { rejectionReason } = req.body;
+
+    if (!rejectionReason || rejectionReason.trim() === "") {
+      return res.status(400).json({ error: "Rejection reason is required" });
+    }
+
+    const approverRole = req.user.role;
+    const approverUserId = req.user.userId;
+
+    const employee = await Employee.findById(req.params.employeeId).populate(
+      "userId",
+      "role email"
+    );
+
+    if (!employee) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
+
+    // Do not allow users to reject their own profile
+    if (employee.userId && String(employee.userId._id) === String(approverUserId)) {
+      return res.status(403).json({ error: "You cannot reject your own profile" });
+    }
+
+    // Check permissions
+    const allowedTargetRoles = approverRole === 2 ? [3] : [2, 3];
+
+    if (!employee.userId || !allowedTargetRoles.includes(employee.userId.role)) {
+      return res.status(403).json({ error: "You are not allowed to reject this profile" });
+    }
+
+    employee.approval_status = -1;
+    employee.rejectionReason = rejectionReason;
+    employee.updatedAt = Date.now();
+    await employee.save();
+
+    res.json({
+      message: "Profile rejected successfully",
       employee,
     });
   } catch (error) {
@@ -255,6 +317,35 @@ router.get("/", verifyToken, async (req, res) => {
 
     const employees = await Employee.find(query).populate("userId", "email");
     res.json(employees);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update profile picture only (doesn't affect approval status)
+router.patch("/profile/picture", verifyToken, async (req, res) => {
+  try {
+    const { profilePicture } = req.body;
+
+    if (!profilePicture) {
+      return res.status(400).json({ error: "Profile picture is required" });
+    }
+
+    const employee = await Employee.findOne({ userId: req.user.userId });
+
+    if (!employee) {
+      return res.status(404).json({ error: "Employee profile not found" });
+    }
+
+    // Update only the profile picture, don't change approval status
+    employee.profilePicture = profilePicture;
+    employee.updatedAt = Date.now();
+
+    await employee.save();
+    res.json({
+      message: "Profile picture updated successfully",
+      employee,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

@@ -55,6 +55,14 @@ const employeeSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    dateHired: {
+      type: Date,
+      required: false,
+    },
+    profilePicture: {
+      type: String,
+      required: false,
+    },
     sssNumber: {
       type: String,
       required: false,
@@ -71,10 +79,27 @@ const employeeSchema = new mongoose.Schema(
       type: String,
       required: false,
     },
+    // Leave Credits (1 per month from hire date)
+    leaveCredits: {
+      type: Number,
+      default: 0,
+    },
+    usedLeaveCredits: {
+      type: Number,
+      default: 0,
+    },
+    lastLeaveCalculation: {
+      type: Date,
+      required: false,
+    },
     approval_status: {
       type: Number,
-      enum: [0, 1], // 0 = pending, 1 = approved
+      enum: [-1, 0, 1], // -1 = rejected, 0 = pending, 1 = approved
       default: 0,
+    },
+    rejectionReason: {
+      type: String,
+      required: false,
     },
     createdAt: {
       type: Date,

@@ -123,8 +123,12 @@ function cleanTIN(tin) {
 function cleanAmount(amount) {
   if (!amount) return null;
   
-  // Remove currency symbols and spaces
-  let cleaned = amount.replace(/[₱$,\s]/g, '');
+  // Remove currency symbols, currency codes, and spaces
+  // Handle: $, ₱, PHP, USD, EUR, etc.
+  let cleaned = amount.replace(/[₱$€£¥₹RM,\s]/g, '');
+  
+  // Remove currency codes (PHP, USD, EUR, etc.) - case insensitive
+  cleaned = cleaned.replace(/[A-Z]{3}/gi, '');
   
   // Fix common OCR mistakes in numbers
   cleaned = cleaned.replace(/[Oo]/g, '0');

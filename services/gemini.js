@@ -1,18 +1,44 @@
 require("dotenv").config();
-const { Mistral } = require("@mistralai/mistralai");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 const fs = require("fs");
+const axios = require("axios");
 
-const mistral = new Mistral({
-  apiKey: "tsrmmG7C0AOSo8qE5pFQRjI0tdBtN4lg"
-});
+// Initialize Gemini
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "AIzaSyBSkwwLLH-1MN8aoke8E2lxMsJfHMIOoEE");
 
-// New: Analyze receipt image directly using Mistral Vision
-async function analyzeReceiptImage(imagePath) {
+// Helper function to get image buffer from path or URL
+async function getImageBuffer(imagePathOrUrl) {
+  // Check if it's a URL (Cloudinary)
+  if (imagePathOrUrl.startsWith('http://') || imagePathOrUrl.startsWith('https://')) {
+    console.log("Fetching image from URL:", imagePathOrUrl);
+    const response = await axios.get(imagePathOrUrl, { responseType: 'arraybuffer' });
+    return Buffer.from(response.data);
+  }
+  
+  // Local file path
+  console.log("Reading image from local file:", imagePathOrUrl);
+  return fs.readFileSync(imagePathOrUrl);
+}
+
+// ==================== GEMINI VISION (PRIMARY) ====================
+
+async function analyzeReceiptWithGemini(imagePath, retryCount = 0) {
+  const maxRetries = 3;
+  
   try {
-    // Read image and convert to base64
-    const imageBuffer = fs.readFileSync(imagePath);
+    console.log("Using Gemini Vision API for receipt analysis...");
+    
+    // Read image from URL or local path
+    const imageBuffer = await getImageBuffer(imagePath);
     const base64Image = imageBuffer.toString('base64');
-    const mimeType = imagePath.endsWith('.png') ? 'image/png' : 'image/jpeg';
+    
+    // Determine mime type from buffer or URL
+    let mimeType = 'image/jpeg';
+    if (imagePath.includes('.png') || imagePath.endsWith('.png')) {
+      mimeType = 'image/png';
+    }
+    
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     
     const prompt = `
 You are an intelligent receipt and payment transaction parser. Analyze this image and extract the following information:
@@ -41,42 +67,65 @@ RETURN ONLY JSON (no markdown, no backticks):
 }
 `;
 
-    const result = await mistral.chat.complete({
-      model: "pixtral-12b-2409",
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: prompt
-            },
-            {
-              type: "image_url",
-              imageUrl: `data:${mimeType};base64,${base64Image}`
-            }
-          ]
+    const result = await model.generateContent([
+      prompt,
+      {
+        inlineData: {
+          data: base64Image,
+          mimeType: mimeType
         }
-      ]
-    });
+      }
+    ]);
     
-    const text = result.choices[0].message.content;
+    const response = await result.response;
+    const text = response.text();
+    
+    // Extract JSON from response
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     
     if (!jsonMatch) {
-      throw new Error("No JSON found in response");
+      throw new Error("No JSON found in Gemini response");
     }
     
     const extracted = JSON.parse(jsonMatch[0]);
-    console.log("Vision API extracted:", extracted);
+    console.log("Gemini Vision extracted:", extracted);
     return extracted;
   } catch (error) {
-    console.error("Vision API error:", error);
+    console.error("Gemini Vision error:", error.message);
+    
+    // Check if it's a quota exceeded error (daily limit, not per-minute rate limit)
+    const isQuotaExceeded = 
+      error.message?.includes('quota') ||
+      error.message?.includes('QUOTA') ||
+      error.message?.includes('exceeded your current quota');
+    
+    // Check if it's a rate limit error (per-minute limit, can be retried)
+    const isRateLimitError = 
+      error.message?.includes('429') || 
+      error.message?.includes('rate_limit_exceeded') ||
+      error.message?.includes('RESOURCE_EXHAUSTED');
+    
+    // Don't retry if quota is exceeded (daily limit) - fail immediately to fallback to OCR
+    if (isQuotaExceeded) {
+      console.log("Daily quota exceeded. Throwing error to trigger fallback to OCR.");
+      throw error;
+    }
+    
+    // Only retry for per-minute rate limits
+    if (isRateLimitError && retryCount < maxRetries) {
+      // Exponential backoff: wait 5, 10, 15 seconds
+      const waitTime = 5000 * (retryCount + 1);
+      console.log(`Rate limit hit. Retrying in ${waitTime/1000} seconds... (Attempt ${retryCount + 1}/${maxRetries})`);
+      
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+      return analyzeReceiptWithGemini(imagePath, retryCount + 1);
+    }
+    
     throw error;
   }
 }
 
-// Old: Analyze receipt from OCR text (kept as fallback)
+// Analyze receipt from OCR text (fallback when vision API fails)
 async function analyzeReceiptText(ocrText) {
   const prompt = `
 You are an intelligent receipt and payment transaction parser. You MUST extract the amount even if other fields are missing.
@@ -136,12 +185,9 @@ JSON FORMAT:
 }
 `;
 
-  const result = await mistral.chat.complete({
-    model: "mistral-small",
-    messages: [{ role: "user", content: prompt }]
-  });
-  
-  const text = result.choices[0].message.content;
+  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+  const result = await model.generateContent(prompt);
+  const text = result.response.text();
 
   const jsonMatch = text.match(/\{[\s\S]*\}/);
   const extracted = JSON.parse(jsonMatch[0]);
@@ -175,4 +221,18 @@ JSON FORMAT:
   return extracted;
 }
 
-module.exports = { analyzeReceiptText, analyzeReceiptImage };
+// Main function: Analyze receipt image using Gemini Vision API
+async function analyzeReceiptImage(imagePath) {
+  try {
+    return await analyzeReceiptWithGemini(imagePath);
+  } catch (error) {
+    console.error("Gemini Vision API failed:", error.message);
+    throw error;
+  }
+}
+
+module.exports = { 
+  analyzeReceiptText, 
+  analyzeReceiptImage,
+  analyzeReceiptWithGemini
+};

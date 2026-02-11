@@ -5,7 +5,9 @@
   "main": "server.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "start": "node server.js",
+    "worker": "node workers/receiptWorker.js",
+    "dev": "concurrently \"npm start\" \"npm run worker\""
   },
   "keywords": [],
   "author": "",
@@ -14,7 +16,9 @@
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
     "@mistralai/mistralai": "^1.13.0",
+    "axios": "^1.13.4",
     "bcryptjs": "^3.0.3",
+    "cloudinary": "^2.9.0",
     "cors": "^2.8.6",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
@@ -23,5 +27,8 @@
     "multer": "^2.0.2",
     "sharp": "^0.34.5",
     "tesseract.js": "^7.0.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
   }
 }

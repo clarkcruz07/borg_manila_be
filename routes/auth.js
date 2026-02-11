@@ -147,21 +147,24 @@ router.get("/users", verifyToken, async (req, res) => {
   try {
     const users = await User.find().select("email role createdAt passwordChanged").exec();
     
-    // Populate employee names
-    const usersWithNames = await Promise.all(
+    // Populate employee details including profile picture, position, and dateHired
+    const usersWithDetails = await Promise.all(
       users.map(async (user) => {
-        const employee = await Employee.findOne({ userId: user._id }).select("firstName lastName");
+        const employee = await Employee.findOne({ userId: user._id }).select("firstName lastName position dateHired profilePicture");
         return {
           ...user.toObject(),
           firstName: employee?.firstName || null,
           lastName: employee?.lastName || null,
+          position: employee?.position || null,
+          dateHired: employee?.dateHired || null,
+          profilePicture: employee?.profilePicture || null,
         };
       })
     );
     
     res.json({
-      total: usersWithNames.length,
-      users: usersWithNames,
+      total: usersWithDetails.length,
+      users: usersWithDetails,
     });
   } catch (error) {
     console.error("Get users error:", error);

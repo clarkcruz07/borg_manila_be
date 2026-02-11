@@ -10,7 +10,6 @@ const Employee = require("../models/Employee");
 const Job = require("../models/Job");
 const { saveReceiptAsJPG, createFolderStructureAsync } = require("../services/fileManager");
 const { cleanExtractedData } = require("../services/textCleaner");
-const { cloudinary, USE_CLOUDINARY } = require("../config/cloudinary");
 
 const router = express.Router();
 const upload = multer({ dest: "uploads/" });
@@ -100,16 +99,12 @@ router.post("/upload", verifyToken, upload.single("receipt"), async (req, res) =
       return res.status(400).json({ error: "No file uploaded" });
     }
 
-    // Keep file locally for now - will upload to Cloudinary after processing with correct date folder
-    const filePath = req.file.path;
-
     // Create job for background processing
     const job = await Job.create({
       userId: req.user.userId,
-      filePath: filePath, // Local path for now
+      filePath: req.file.path,
       originalName: req.file.originalname,
-      status: 'pending',
-      cloudinaryUrl: null // Will be set after processing
+      status: 'pending'
     });
 
     console.log(`Job created: ${job._id} for user ${req.user.userId}`);
@@ -138,84 +133,30 @@ router.post("/upload", verifyToken, upload.single("receipt"), async (req, res) =
 // Cancel/delete a job
 router.delete("/jobs/:jobId", verifyToken, async (req, res) => {
   try {
-    console.log(`\n→ DELETE /jobs/${req.params.jobId} called`);
-    
     const job = await Job.findOne({
       _id: req.params.jobId,
       userId: req.user.userId
     });
 
     if (!job) {
-      console.log(`  ✗ Job not found: ${req.params.jobId}`);
       return res.status(404).json({ error: "Job not found" });
     }
 
-    console.log(`  ✓ Job found:`, {
-      id: job._id,
-      status: job.status,
-      filePath: job.filePath,
-      cloudinaryUrl: job.cloudinaryUrl || 'NOT SET'
-    });
+    // Only allow cancellation of pending or processing jobs
+    if (job.status === 'pending' || job.status === 'processing') {
+      // Update status to cancelled
+      job.status = 'cancelled';
+      await job.save();
 
-    // Allow deletion of any job (pending, processing, completed, failed)
-    // Update status to cancelled
-    job.status = 'cancelled';
-    await job.save();
-    console.log(`  ✓ Job status updated to cancelled`);
-
-    // Clean up Cloudinary file if it exists
-    if (job.cloudinaryUrl && USE_CLOUDINARY) {
-      try {
-        console.log(`  → Job cloudinaryUrl:`, job.cloudinaryUrl);
-        
-        // Extract public_id from Cloudinary URL
-        // URL format: https://res.cloudinary.com/{cloud_name}/image/upload/v{version}/{folder}/{public_id}.{format}
-        // Decode URL first to handle encoded characters like %2C (comma)
-        const decodedUrl = decodeURIComponent(job.cloudinaryUrl);
-        console.log(`  → Decoded URL:`, decodedUrl);
-        
-        const urlParts = decodedUrl.split('/');
-        const fileWithExtension = urlParts[urlParts.length - 1];
-        const fileName = fileWithExtension.split('.')[0];
-        
-        // Reconstruct full public_id with folder path
-        const uploadIndex = urlParts.indexOf('upload');
-        // Get everything after 'upload' except the last part (which is the filename)
-        // Skip version number (starts with 'v' followed by digits)
-        let startIndex = uploadIndex + 1;
-        if (urlParts[startIndex] && /^v\d+$/.test(urlParts[startIndex])) {
-          startIndex++; // Skip version number
-        }
-        
-        const folderParts = urlParts.slice(startIndex, -1);
-        const publicId = [...folderParts, fileName].join('/');
-        
-        console.log(`  → Attempting to delete from Cloudinary with public_id: ${publicId}`);
-        const result = await cloudinary.uploader.destroy(publicId);
-        console.log(`  ✓ Cloudinary deletion result:`, result);
-        
-        if (result.result === 'not found') {
-          console.warn(`  ⚠️  File not found in Cloudinary, may have been already deleted`);
-        } else if (result.result === 'ok') {
-          console.log(`  ✓ Successfully deleted from Cloudinary`);
-        }
-      } catch (cloudinaryError) {
-        console.error("  ✗ Failed to delete from Cloudinary:", cloudinaryError.message);
-        console.error("  ✗ Stack:", cloudinaryError.stack);
-        // Continue anyway - file might already be deleted
-      }
-    } else if (!job.cloudinaryUrl) {
-      console.log(`  → No cloudinaryUrl found on job, skipping Cloudinary deletion`);
-    }
-
-    // Clean up local file if it exists
-    if (job.filePath && !job.filePath.startsWith('http://') && !job.filePath.startsWith('https://')) {
-      if (fs.existsSync(job.filePath)) {
+      // Clean up uploaded file if it exists
+      if (job.filePath && fs.existsSync(job.filePath)) {
         fs.unlinkSync(job.filePath);
       }
-    }
 
-    res.json({ message: "Job cancelled and files deleted successfully" });
+      res.json({ message: "Job cancelled successfully" });
+    } else {
+      res.status(400).json({ error: `Cannot cancel job with status: ${job.status}` });
+    }
   } catch (err) {
     console.error("Cancel job error:", err);
     res.status(500).json({ error: err.message });
@@ -272,14 +213,11 @@ router.get("/jobs", verifyToken, async (req, res) => {
 // Save uploaded receipt + extracted fields to DB (protected)
 router.post("/", verifyToken, async (req, res) => {
   try {
-    const { filePath, originalName, extracted, jobId } = req.body;
+    const { filePath, originalName, extracted } = req.body;
 
     if (!filePath) {
       return res.status(400).json({ error: "filePath is required" });
     }
-
-    // Check if filePath is a Cloudinary URL
-    const isCloudinaryUrl = filePath.startsWith('http://') || filePath.startsWith('https://');
 
     // Generate receipt fingerprint for same-receipt detection (check before conversion)
     const receiptKey = generateReceiptKey(extracted);
@@ -302,37 +240,30 @@ router.post("/", verifyToken, async (req, res) => {
       }
     }
 
-    let jpgFilePath = filePath;
-    let jpgFileHash = null;
-
-    // Only convert to JPG and compute hash if it's a local file
-    if (!isCloudinaryUrl) {
-      // Convert to JPG and save to employee folder structure
-      jpgFilePath = await saveReceiptAsJPG(filePath, req.user.userId, extracted?.date, Employee);
+    // Convert to JPG and save to employee folder structure
+    // This happens synchronously but folder creation was already started in background
+    const jpgFilePath = await saveReceiptAsJPG(filePath, req.user.userId, extracted?.date, Employee);
+    
+    // Compute file hash for exact duplicate detection (on the JPG file)
+    const jpgFileHash = computeFileHash(jpgFilePath);
+    
+    // Check for duplicate file (exact same file uploaded) - after conversion
+    if (jpgFileHash) {
+      const duplicateFile = await Receipt.findOne({
+        userId: req.user.userId,
+        fileHash: jpgFileHash,
+      });
       
-      // Compute file hash for exact duplicate detection (on the JPG file)
-      jpgFileHash = computeFileHash(jpgFilePath);
-      
-      // Check for duplicate file (exact same file uploaded) - after conversion
-      if (jpgFileHash) {
-        const duplicateFile = await Receipt.findOne({
-          userId: req.user.userId,
-          fileHash: jpgFileHash,
+      if (duplicateFile) {
+        console.log("Duplicate file detected:", duplicateFile._id);
+        // Clean up the JPG file we just created (use promises API)
+        fs.promises
+          .unlink(jpgFilePath)
+          .catch(err => console.warn("Could not delete duplicate JPG:", err));
+        return res.status(409).json({
+          error: "Duplicate receipt detected: This exact file has already been uploaded",
         });
-        
-        if (duplicateFile) {
-          console.log("Duplicate file detected:", duplicateFile._id);
-          // Clean up the JPG file we just created
-          fs.promises
-            .unlink(jpgFilePath)
-            .catch(err => console.warn("Could not delete duplicate JPG:", err));
-          return res.status(409).json({
-            error: "Duplicate receipt detected: This exact file has already been uploaded",
-          });
-        }
       }
-    } else {
-      console.log("Cloudinary URL detected, skipping JPG conversion and file hash");
     }
     
     if (!receiptKey) {
@@ -398,18 +329,6 @@ router.post("/", verifyToken, async (req, res) => {
     });
 
     console.log("Receipt saved successfully as JPG:", receipt._id, "at", jpgFilePath);
-    
-    // Delete the completed job from MongoDB after successful save
-    if (jobId) {
-      try {
-        await Job.findByIdAndDelete(jobId);
-        console.log(`✓ Deleted completed job: ${jobId}`);
-      } catch (jobDeleteError) {
-        console.error("Failed to delete job:", jobDeleteError.message);
-        // Don't fail the request if job deletion fails
-      }
-    }
-    
     res.status(201).json(receipt);
   } catch (err) {
     console.error("RECEIPT SAVE ERROR:", err);
