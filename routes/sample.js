@@ -28,8 +28,8 @@ router.post("/analyze-image", async (req, res) => {
       prompt ||
       [
         "Extract these fields from the receipt image and return JSON only:",
-        "shopName, tinNumber, amountDue, address, date",
-        "If a field is missing, return null.",
+        "shopName, tinNumber, amountDue, address(CITY Only), date(converted to mm/dd/yyyy)",
+        "If a field is missing, return not found.",
       ].join(" ");
 
     const payload = {
