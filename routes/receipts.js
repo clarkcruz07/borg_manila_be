@@ -100,16 +100,36 @@ router.post("/upload", verifyToken, upload.single("receipt"), async (req, res) =
       return res.status(400).json({ error: "No file uploaded" });
     }
 
-    // Keep file locally for now - will upload to Cloudinary after processing with correct date folder
     const filePath = req.file.path;
+    let cloudinaryUrl = null;
+
+    // Upload to Cloudinary immediately if enabled (required for stateless environments like Cloud Run)
+    if (USE_CLOUDINARY) {
+      try {
+        console.log(`Uploading to Cloudinary: ${filePath}`);
+        const result = await cloudinary.uploader.upload(filePath, {
+          folder: 'receipts/pending', // Temporary folder for unprocessed receipts
+          resource_type: 'image'
+        });
+        cloudinaryUrl = result.secure_url;
+        console.log(`Uploaded to Cloudinary: ${cloudinaryUrl}`);
+        
+        // Delete local file after successful Cloudinary upload
+        fs.unlinkSync(filePath);
+        console.log(`Deleted local file: ${filePath}`);
+      } catch (uploadErr) {
+        console.error('Cloudinary upload error:', uploadErr);
+        // Continue with local path as fallback
+      }
+    }
 
     // Create job for background processing
     const job = await Job.create({
       userId: req.user.userId,
-      filePath: filePath, // Local path for now
+      filePath: cloudinaryUrl || filePath, // Use Cloudinary URL if available, otherwise local path
       originalName: req.file.originalname,
       status: 'pending',
-      cloudinaryUrl: null // Will be set after processing
+      cloudinaryUrl: cloudinaryUrl // Set if uploaded to Cloudinary
     });
 
     console.log(`Job created: ${job._id} for user ${req.user.userId}`);

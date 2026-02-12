@@ -3,6 +3,7 @@ const mongoose = require("mongoose");
 const fs = require("fs");
 const path = require("path");
 const sharp = require("sharp");
+const axios = require("axios");
 const Job = require("../models/Job");
 const Employee = require("../models/Employee");
 const { analyzeReceiptImage } = require("../services/gemini");
@@ -58,13 +59,41 @@ async function processJob(job) {
 
     console.log(`  ✓ Job ${job._id} locked for processing`);
 
-    // Verify file exists before processing
-    if (!fs.existsSync(job.filePath)) {
-      throw new Error(`Receipt file not found: ${job.filePath}`);
+    // Handle both local files and Cloudinary URLs
+    let localFilePath = job.filePath;
+    let tempDownloadedFile = null;
+
+    // If filePath is a Cloudinary URL, download it first
+    if (job.filePath.startsWith('http://') || job.filePath.startsWith('https://')) {
+      console.log(`  → Downloading from Cloudinary: ${job.filePath}`);
+      try {
+        const response = await axios.get(job.filePath, { responseType: 'arraybuffer' });
+        const tempDir = path.join(__dirname, '..', 'uploads', 'temp');
+        
+        // Create temp directory if it doesn't exist
+        if (!fs.existsSync(tempDir)) {
+          fs.mkdirSync(tempDir, { recursive: true });
+        }
+        
+        // Create temp file
+        tempDownloadedFile = path.join(tempDir, `${job._id}.jpg`);
+        fs.writeFileSync(tempDownloadedFile, response.data);
+        localFilePath = tempDownloadedFile;
+        
+        const fileSize = fs.statSync(localFilePath).size;
+        console.log(`  ✓ Downloaded to temp file: ${localFilePath} (${(fileSize / 1024).toFixed(0)}KB)`);
+      } catch (downloadErr) {
+        throw new Error(`Failed to download from Cloudinary: ${downloadErr.message}`);
+      }
+    } else {
+      // Verify local file exists
+      if (!fs.existsSync(job.filePath)) {
+        throw new Error(`Receipt file not found: ${job.filePath}`);
+      }
+      
+      const fileSize = fs.statSync(job.filePath).size;
+      console.log(`  → File confirmed: ${job.filePath} (${(fileSize / 1024).toFixed(0)}KB)`);
     }
-    
-    const fileSize = fs.statSync(job.filePath).size;
-    console.log(`  → File confirmed: ${job.filePath} (${(fileSize / 1024).toFixed(0)}KB)`);
 
     let extracted;
     
@@ -72,7 +101,7 @@ async function processJob(job) {
       // Try Gemini Vision API first
       console.log("  → Analyzing with Vision API...");
       try {
-        extracted = await analyzeReceiptImage(job.filePath);
+        extracted = await analyzeReceiptImage(localFilePath);
         console.log("  → Vision API succeeded");
       } catch (visionError) {
         console.error("  → Vision API error:", visionError.message);
@@ -131,19 +160,19 @@ async function processJob(job) {
     let cloudinaryUrl = null;
     let finalFilePath = job.filePath;
     
-    if (USE_CLOUDINARY && fs.existsSync(job.filePath)) {
+    if (USE_CLOUDINARY && fs.existsSync(localFilePath)) {
       try {
         console.log("  → Compressing image for Cloudinary...");
         
         // Compress image: resize to max 1920px width, convert to JPEG with 85% quality
-        const compressedPath = path.join(path.dirname(job.filePath), `compressed_${Date.now()}.jpg`);
+        const compressedPath = path.join(path.dirname(localFilePath), `compressed_${Date.now()}.jpg`);
         
-        await sharp(job.filePath)
+        await sharp(localFilePath)
           .resize({ width: 1920, withoutEnlargement: true }) // Don't enlarge small images
           .jpeg({ quality: 85 }) // 85% quality - good balance between size and clarity
           .toFile(compressedPath);
         
-        const originalSize = fs.statSync(job.filePath).size;
+        const originalSize = fs.statSync(localFilePath).size;
         const compressedSize = fs.statSync(compressedPath).size;
         const savedPercent = Math.round((1 - compressedSize / originalSize) * 100);
         
@@ -192,11 +221,15 @@ async function processJob(job) {
         console.log(`  ✓ Uploaded to Cloudinary: ${cloudinaryUrl}`);
 
         // Delete both original and compressed local files
-        if (fs.existsSync(job.filePath)) {
+        if (fs.existsSync(job.filePath) && !job.filePath.startsWith('http://') && !job.filePath.startsWith('https://')) {
           fs.unlinkSync(job.filePath);
         }
         if (fs.existsSync(compressedPath)) {
           fs.unlinkSync(compressedPath);
+        }
+        // Clean up temp downloaded file if it exists
+        if (tempDownloadedFile && fs.existsSync(tempDownloadedFile)) {
+          fs.unlinkSync(tempDownloadedFile);
         }
         console.log("  ✓ Local files cleaned up");
       } catch (cloudinaryError) {
@@ -223,9 +256,25 @@ async function processJob(job) {
 
     console.log(`  ✓ Job ${job._id} completed successfully (${completeResult.modifiedCount} document updated)`);
     
+    // Clean up temp downloaded file if it exists
+    if (tempDownloadedFile && fs.existsSync(tempDownloadedFile)) {
+      fs.unlinkSync(tempDownloadedFile);
+      console.log("  ✓ Temp file cleaned up");
+    }
+    
   } catch (error) {
     console.error(`  ✗ Job ${job._id} failed:`, error);
     console.error(`  ✗ Error stack:`, error.stack);
+    
+    // Clean up temp downloaded file if it exists
+    if (tempDownloadedFile && fs.existsSync(tempDownloadedFile)) {
+      try {
+        fs.unlinkSync(tempDownloadedFile);
+        console.log("  ✓ Temp file cleaned up after error");
+      } catch (cleanupErr) {
+        console.error("  ✗ Failed to clean up temp file:", cleanupErr);
+      }
+    }
     
     // Check if we should retry
     if (job.attempts < MAX_ATTEMPTS) {
