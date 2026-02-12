@@ -35,11 +35,23 @@ async function connectDB() {
   }
 }
 
+// Timeout wrapper for async operations
+function withTimeout(promise, timeoutMs, operationName) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${operationName} timed out after ${timeoutMs}ms`)), timeoutMs)
+    )
+  ]);
+}
+
 async function processJob(job) {
+  const startTime = Date.now();
   console.log(`\n[${new Date().toISOString()}] Processing job ${job._id}...`);
   
   try {
     // Update status to processing with atomic operation to prevent duplicate processing
+    console.log(`  [+${Date.now() - startTime}ms] Updating status to processing...`);
     const updateResult = await Job.updateOne(
       { 
         _id: job._id,
@@ -50,6 +62,7 @@ async function processJob(job) {
         $inc: { attempts: 1 }
       }
     );
+    console.log(`  [+${Date.now() - startTime}ms] Status updated`);
 
     // If no document was updated, another worker already grabbed it
     if (updateResult.modifiedCount === 0) {
@@ -65,14 +78,22 @@ async function processJob(job) {
 
     // If filePath is a Cloudinary URL, download it first
     if (job.filePath.startsWith('http://') || job.filePath.startsWith('https://')) {
-      console.log(`  → Downloading from Cloudinary: ${job.filePath}`);
+      console.log(`  → File is a Cloudinary URL: ${job.filePath}`);
+      console.log(`  → Downloading from Cloudinary...`);
       try {
-        const response = await axios.get(job.filePath, { responseType: 'arraybuffer' });
+        const response = await axios.get(job.filePath, { 
+          responseType: 'arraybuffer',
+          timeout: 30000 // 30 second timeout
+        });
+        
+        console.log(`  ✓ Download successful (${response.data.byteLength} bytes)`);
+        
         const tempDir = path.join(__dirname, '..', 'uploads', 'temp');
         
         // Create temp directory if it doesn't exist
         if (!fs.existsSync(tempDir)) {
           fs.mkdirSync(tempDir, { recursive: true });
+          console.log(`  ✓ Created temp directory: ${tempDir}`);
         }
         
         // Create temp file
@@ -81,30 +102,39 @@ async function processJob(job) {
         localFilePath = tempDownloadedFile;
         
         const fileSize = fs.statSync(localFilePath).size;
-        console.log(`  ✓ Downloaded to temp file: ${localFilePath} (${(fileSize / 1024).toFixed(0)}KB)`);
+        console.log(`  ✓ Saved to temp file: ${localFilePath} (${(fileSize / 1024).toFixed(0)}KB)`);
       } catch (downloadErr) {
+        console.error(`  ✗ Download failed:`, downloadErr.message);
+        console.error(`  ✗ URL that failed: ${job.filePath}`);
+        console.error(`  ✗ Status: ${downloadErr.response?.status}`);
+        console.error(`  ✗ Status text: ${downloadErr.response?.statusText}`);
         throw new Error(`Failed to download from Cloudinary: ${downloadErr.message}`);
       }
     } else {
       // Verify local file exists
       if (!fs.existsSync(job.filePath)) {
+        console.error(`  ✗ Local file not found: ${job.filePath}`);
         throw new Error(`Receipt file not found: ${job.filePath}`);
       }
       
       const fileSize = fs.statSync(job.filePath).size;
-      console.log(`  → File confirmed: ${job.filePath} (${(fileSize / 1024).toFixed(0)}KB)`);
+      console.log(`  ✓ Local file confirmed: ${job.filePath} (${(fileSize / 1024).toFixed(0)}KB)`);
     }
 
     let extracted;
     
     try {
       // Try Gemini Vision API first
-      console.log("  → Analyzing with Vision API...");
+      console.log(`  [+${Date.now() - startTime}ms] → Analyzing with Vision API...`);
       try {
-        extracted = await analyzeReceiptImage(localFilePath);
-        console.log("  → Vision API succeeded");
+        extracted = await withTimeout(
+          analyzeReceiptImage(localFilePath),
+          60000, // 60 second timeout
+          "Vision API analysis"
+        );
+        console.log(`  [+${Date.now() - startTime}ms] ✓ Vision API succeeded`);
       } catch (visionError) {
-        console.error("  → Vision API error:", visionError.message);
+        console.error(`  [+${Date.now() - startTime}ms] ✗ Vision API error:`, visionError.message);
         
         // OCR fallback is temporarily disabled for Groq-only testing.
         /*
@@ -157,28 +187,32 @@ async function processJob(job) {
     });
 
     // Upload to Cloudinary with date-based folder structure
-    let cloudinaryUrl = null;
+    let cloudinaryUrl = job.cloudinaryUrl; // Start with existing URL (from pending folder)
     let finalFilePath = job.filePath;
     
     if (USE_CLOUDINARY && fs.existsSync(localFilePath)) {
       try {
-        console.log("  → Compressing image for Cloudinary...");
+        console.log(`  [+${Date.now() - startTime}ms] → Compressing image for Cloudinary...`);
         
         // Compress image: resize to max 1920px width, convert to JPEG with 85% quality
         const compressedPath = path.join(path.dirname(localFilePath), `compressed_${Date.now()}.jpg`);
         
-        await sharp(localFilePath)
-          .resize({ width: 1920, withoutEnlargement: true }) // Don't enlarge small images
-          .jpeg({ quality: 85 }) // 85% quality - good balance between size and clarity
-          .toFile(compressedPath);
+        await withTimeout(
+          sharp(localFilePath)
+            .resize({ width: 1920, withoutEnlargement: true }) // Don't enlarge small images
+            .jpeg({ quality: 85 }) // 85% quality - good balance between size and clarity
+            .toFile(compressedPath),
+          30000, // 30 second timeout for compression
+          "Image compression"
+        );
         
         const originalSize = fs.statSync(localFilePath).size;
         const compressedSize = fs.statSync(compressedPath).size;
         const savedPercent = Math.round((1 - compressedSize / originalSize) * 100);
         
-        console.log(`  ✓ Compressed: ${(originalSize / 1024).toFixed(0)}KB → ${(compressedSize / 1024).toFixed(0)}KB (${savedPercent}% reduction)`);
+        console.log(`  [+${Date.now() - startTime}ms] ✓ Compressed: ${(originalSize / 1024).toFixed(0)}KB → ${(compressedSize / 1024).toFixed(0)}KB (${savedPercent}% reduction)`);
         
-        console.log("  → Uploading to Cloudinary with date-based folder...");
+        console.log(`  [+${Date.now() - startTime}ms] → Uploading to Cloudinary with date-based folder...`);
         
         // Get employee info for folder structure
         const employee = await Employee.findOne({ userId: job.userId });
@@ -209,21 +243,44 @@ async function processJob(job) {
           folderPath = `receipts/${employeeName}/${year}/${month}/${day}`;
         }
         
-        // Upload compressed image
-        const result = await cloudinary.uploader.upload(compressedPath, {
-          folder: folderPath,
-          resource_type: "image",
-          public_id: `${Date.now()}_${job.originalName.replace(/\.[^/.]+$/, "")}`,
-        });
+        // Upload compressed image to date-based folder
+        console.log(`  [+${Date.now() - startTime}ms] → Uploading to folder: ${folderPath}`);
+        const result = await withTimeout(
+          cloudinary.uploader.upload(compressedPath, {
+            folder: folderPath,
+            resource_type: "image",
+            public_id: `${Date.now()}_${job.originalName.replace(/\.[^/.]+$/, "")}`,
+          }),
+          60000, // 60 second timeout for upload
+          "Cloudinary upload to date folder"
+        );
 
         cloudinaryUrl = result.secure_url;
         finalFilePath = cloudinaryUrl;
-        console.log(`  ✓ Uploaded to Cloudinary: ${cloudinaryUrl}`);
+        console.log(`  [+${Date.now() - startTime}ms] ✓ Uploaded to Cloudinary: ${cloudinaryUrl}`);
 
-        // Delete both original and compressed local files
-        if (fs.existsSync(job.filePath) && !job.filePath.startsWith('http://') && !job.filePath.startsWith('https://')) {
-          fs.unlinkSync(job.filePath);
+        // Delete the old pending file from Cloudinary if it exists
+        if (job.cloudinaryUrl && job.cloudinaryUrl.includes('/receipts/pending/')) {
+          try {
+            console.log(`  [+${Date.now() - startTime}ms] → Deleting pending file from Cloudinary...`);
+            const urlParts = job.cloudinaryUrl.split('/');
+            const fileWithExtension = urlParts[urlParts.length - 1];
+            const fileName = fileWithExtension.split('.')[0];
+            const publicId = `receipts/pending/${fileName}`;
+            
+            const deleteResult = await withTimeout(
+              cloudinary.uploader.destroy(publicId),
+              30000, // 30 second timeout for delete
+              "Cloudinary pending file deletion"
+            );
+            console.log(`  [+${Date.now() - startTime}ms] ✓ Deleted pending file: ${deleteResult.result}`);
+          } catch (deleteErr) {
+            console.error(`  [+${Date.now() - startTime}ms] ⚠️  Failed to delete pending file:`, deleteErr.message);
+            // Continue anyway - not critical
+          }
         }
+
+        // Clean up compressed temp file
         if (fs.existsSync(compressedPath)) {
           fs.unlinkSync(compressedPath);
         }
@@ -231,15 +288,17 @@ async function processJob(job) {
         if (tempDownloadedFile && fs.existsSync(tempDownloadedFile)) {
           fs.unlinkSync(tempDownloadedFile);
         }
-        console.log("  ✓ Local files cleaned up");
+        console.log(`  [+${Date.now() - startTime}ms] ✓ Local temp files cleaned up`);
       } catch (cloudinaryError) {
-        console.error("  ✗ Cloudinary upload failed:", cloudinaryError.message);
-        // Continue with local file path
+        console.error("  ✗ Cloudinary upload failed:", cloudinaryError);
+        console.error("  ✗ Stack:", cloudinaryError.stack);
+        // Continue with existing cloudinary URL
+        finalFilePath = job.cloudinaryUrl || job.filePath;
       }
     }
 
     // Update job with results
-    console.log("  → Updating job status to completed...");
+    console.log(`  [+${Date.now() - startTime}ms] → Updating job status to completed...`);
     const completeResult = await Job.updateOne(
       { _id: job._id },
       {
@@ -254,7 +313,8 @@ async function processJob(job) {
       }
     );
 
-    console.log(`  ✓ Job ${job._id} completed successfully (${completeResult.modifiedCount} document updated)`);
+    const totalTime = ((Date.now() - startTime) / 1000).toFixed(2);
+    console.log(`  [+${Date.now() - startTime}ms] ✓ Job ${job._id} completed successfully in ${totalTime}s (${completeResult.modifiedCount} document updated)`);
     
     // Clean up temp downloaded file if it exists
     if (tempDownloadedFile && fs.existsSync(tempDownloadedFile)) {
@@ -263,7 +323,8 @@ async function processJob(job) {
     }
     
   } catch (error) {
-    console.error(`  ✗ Job ${job._id} failed:`, error);
+    const totalTime = ((Date.now() - startTime) / 1000).toFixed(2);
+    console.error(`  [+${Date.now() - startTime}ms] ✗ Job ${job._id} failed after ${totalTime}s:`, error);
     console.error(`  ✗ Error stack:`, error.stack);
     
     // Clean up temp downloaded file if it exists

@@ -109,17 +109,24 @@ router.post("/upload", verifyToken, upload.single("receipt"), async (req, res) =
         console.log(`Uploading to Cloudinary: ${filePath}`);
         const result = await cloudinary.uploader.upload(filePath, {
           folder: 'receipts/pending', // Temporary folder for unprocessed receipts
-          resource_type: 'image'
+          resource_type: 'image',
+          public_id: `${Date.now()}_${req.file.originalname.replace(/\.[^/.]+$/, "")}`
         });
         cloudinaryUrl = result.secure_url;
-        console.log(`Uploaded to Cloudinary: ${cloudinaryUrl}`);
+        console.log(`✓ Uploaded to Cloudinary: ${cloudinaryUrl}`);
+        console.log(`  Public ID: ${result.public_id}`);
+        console.log(`  Asset ID: ${result.asset_id}`);
         
         // Delete local file after successful Cloudinary upload
-        fs.unlinkSync(filePath);
-        console.log(`Deleted local file: ${filePath}`);
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+          console.log(`✓ Deleted local file: ${filePath}`);
+        }
       } catch (uploadErr) {
-        console.error('Cloudinary upload error:', uploadErr);
+        console.error('✗ Cloudinary upload error:', uploadErr);
+        console.error('  Error details:', uploadErr.message);
         // Continue with local path as fallback
+        cloudinaryUrl = null;
       }
     }
 
@@ -132,7 +139,7 @@ router.post("/upload", verifyToken, upload.single("receipt"), async (req, res) =
       cloudinaryUrl: cloudinaryUrl // Set if uploaded to Cloudinary
     });
 
-    console.log(`Job created: ${job._id} for user ${req.user.userId}`);
+    console.log(`✓ Job created: ${job._id} for user ${req.user.userId}`);
 
     // Return job ID immediately
     res.json({
