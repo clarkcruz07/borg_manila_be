@@ -279,11 +279,12 @@ router.post('/clock-out', verifyToken, upload.single('biometricImage'), async (r
       attendanceData.distance = distance ? Math.round(distance) : null;
     }
 
+    // Calculate work duration before saving
+    const duration = Math.floor((new Date() - lastClockIn.timestamp) / 60000); // minutes
+    attendanceData.duration = duration;
+
     const attendance = new Attendance(attendanceData);
     await attendance.save();
-
-    // Calculate work duration
-    const duration = Math.floor((attendance.timestamp - lastClockIn.timestamp) / 60000); // minutes
 
     res.json({
       success: true,

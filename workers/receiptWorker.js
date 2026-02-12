@@ -372,8 +372,17 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
-// Start the worker
-startWorker().catch(err => {
-  console.error("Worker startup error:", err);
-  process.exit(1);
-});
+// Export functions for use as a module
+module.exports = {
+  startWorker,
+  pollJobs,
+  cleanupOldJobs
+};
+
+// Only start worker if run directly (not imported as module)
+if (require.main === module) {
+  startWorker().catch(err => {
+    console.error("Worker startup error:", err);
+    process.exit(1);
+  });
+}

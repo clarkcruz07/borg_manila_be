@@ -53,11 +53,11 @@ const employeeSchema = new mongoose.Schema(
     },
     department: {
       type: String,
-      required: true,
+      required: false,
     },
     dateHired: {
       type: Date,
-      required: false,
+      required: true,
     },
     profilePicture: {
       type: String,
@@ -65,19 +65,43 @@ const employeeSchema = new mongoose.Schema(
     },
     sssNumber: {
       type: String,
-      required: false,
+      required: true,
+      validate: {
+        validator: function(v) {
+          return /^\d{2}-\d{7}-\d{1}$/.test(v);
+        },
+        message: 'SSS Number must follow format XX-XXXXXXX-X'
+      }
     },
     philhealthNumber: {
       type: String,
-      required: false,
+      required: true,
+      validate: {
+        validator: function(v) {
+          return /^\d{2}-\d{9}-\d{1}$/.test(v);
+        },
+        message: 'PhilHealth Number must follow format XX-XXXXXXXXX-X'
+      }
     },
     tinNumber: {
       type: String,
-      required: false,
+      required: true,
+      validate: {
+        validator: function(v) {
+          return /^\d{3}-\d{3}-\d{3}-\d{3}$/.test(v);
+        },
+        message: 'TIN Number must follow format XXX-XXX-XXX-XXX'
+      }
     },
     pagibigNumber: {
       type: String,
-      required: false,
+      required: true,
+      validate: {
+        validator: function(v) {
+          return /^\d{4}-\d{4}-\d{4}$/.test(v);
+        },
+        message: 'Pag-IBIG Number must follow format XXXX-XXXX-XXXX'
+      }
     },
     // Leave Credits (1 per month from hire date)
     leaveCredits: {

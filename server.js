@@ -20,6 +20,14 @@ app.use(express.urlencoded({ limit: '10mb', extended: true }));
 // Serve uploaded images statically
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
+// Import worker functions
+let workerModule;
+try {
+  workerModule = require("./workers/receiptWorker");
+} catch (err) {
+  console.warn("⚠️  Receipt worker not available:", err.message);
+}
+
 // Connect to MongoDB on server start
 async function startServer() {
   try {
@@ -37,6 +45,14 @@ async function startServer() {
     const PORT = process.env.PORT || 5000;
     app.listen(PORT, () => {
       console.log(`Backend running on http://localhost:${PORT}`);
+      
+      // Start receipt processing worker in the same process
+      if (workerModule && workerModule.startWorker) {
+        console.log("Starting receipt processing worker...");
+        workerModule.startWorker().catch(err => {
+          console.error("⚠️  Worker startup error:", err.message);
+        });
+      }
     });
   } catch (error) {
     console.error("Failed to start server:", error);

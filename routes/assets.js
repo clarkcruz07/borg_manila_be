@@ -6,20 +6,25 @@ const { verifyToken } = require("../middleware/auth");
 
 const router = express.Router();
 
-// Middleware to check if user is IT department
+// Middleware to check if user is Manager or specific IT user
 async function ensureIT(req, res, next) {
   try {
-    // Check if user's department is IT
-    const employee = await Employee.findOne({ userId: req.user.userId });
-    if (!employee) {
-      return res.status(403).json({ error: "Employee profile not found" });
+    const User = require("../models/User");
+    
+    // Check if user is Manager (role 1) or specific IT email
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      return res.status(403).json({ error: "User not found" });
     }
     
-    if (employee.department && employee.department.toLowerCase() === "it") {
+    const isManager = req.user.role === 1;
+    const isITUser = user.email === "vivol@borgs.com.au";
+    
+    if (isManager || isITUser) {
       return next();
     }
     
-    return res.status(403).json({ error: "Access denied: Only IT department can manage assets" });
+    return res.status(403).json({ error: "Access denied: Insufficient permissions to manage assets" });
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
@@ -28,18 +33,25 @@ async function ensureIT(req, res, next) {
 // Get all assets (all employees can view)
 router.get("/", verifyToken, async (req, res) => {
   try {
-    const role = req.user?.role;
+    const User = require("../models/User");
     const employee = await Employee.findOne({ userId: req.user.userId });
     
     if (!employee) {
       return res.status(404).json({ error: "Employee profile not found" });
     }
     
-    let assets;
-    const isIT = employee.department && employee.department.toLowerCase() === "it";
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
     
-    if (isIT) {
-      // IT can see all assets
+    let assets;
+    const isManager = req.user.role === 1;
+    const isITUser = user.email === "vivol@borgs.com.au";
+    const canManageAssets = isManager || isITUser;
+    
+    if (canManageAssets) {
+      // Managers/IT can see all assets
       assets = await Asset.find()
         .populate("assignedTo", "firstName lastName position department")
         .populate("createdBy", "email")
@@ -52,7 +64,7 @@ router.get("/", verifyToken, async (req, res) => {
         .sort({ createdAt: -1 });
     }
     
-    res.json({ assets, isIT });
+    res.json({ assets, isIT: canManageAssets });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -267,7 +279,11 @@ router.post("/requests", verifyToken, async (req, res) => {
     await assetRequest.save();
 
     const populatedRequest = await AssetRequest.findById(assetRequest._id)
-      .populate("requestedBy", "firstName lastName position department");
+      .populate({
+        path: "requestedBy",
+        select: "firstName lastName position",
+        populate: { path: "userId", select: "email" }
+      });
 
     res.status(201).json({
       message: "Asset request submitted successfully",
@@ -281,18 +297,31 @@ router.post("/requests", verifyToken, async (req, res) => {
 // Get asset requests
 router.get("/requests/all", verifyToken, async (req, res) => {
   try {
+    const User = require("../models/User");
     const employee = await Employee.findOne({ userId: req.user.userId });
     if (!employee) {
       return res.status(404).json({ error: "Employee profile not found" });
     }
+    
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
 
-    const isIT = employee.department && employee.department.toLowerCase() === "it";
+    // Managers or specific IT user can see all requests, regular employees see only their own
+    const isManager = req.user.role === 1;
+    const isITUser = user.email === "vivol@borgs.com.au";
+    const canManageAssets = isManager || isITUser;
 
     let requests;
-    if (isIT) {
-      // IT can see all requests
+    if (canManageAssets) {
+      // Managers/IT can see all requests
       requests = await AssetRequest.find()
-        .populate("requestedBy", "firstName lastName position department")
+        .populate({
+          path: "requestedBy",
+          select: "firstName lastName position",
+          populate: { path: "userId", select: "email" }
+        })
         .populate("approvedBy", "email")
         .populate("deployedBy", "email")
         .populate("assignedAsset")
@@ -300,14 +329,18 @@ router.get("/requests/all", verifyToken, async (req, res) => {
     } else {
       // Regular employees only see their own requests
       requests = await AssetRequest.find({ requestedBy: employee._id })
-        .populate("requestedBy", "firstName lastName position department")
+        .populate({
+          path: "requestedBy",
+          select: "firstName lastName position",
+          populate: { path: "userId", select: "email" }
+        })
         .populate("approvedBy", "email")
         .populate("deployedBy", "email")
         .populate("assignedAsset")
         .sort({ createdAt: -1 });
     }
 
-    res.json({ requests, isIT });
+    res.json({ requests, isIT: canManageAssets });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -332,7 +365,11 @@ router.put("/requests/:id/approve", verifyToken, ensureIT, async (req, res) => {
     await request.save();
 
     const populatedRequest = await AssetRequest.findById(request._id)
-      .populate("requestedBy", "firstName lastName position department")
+      .populate({
+        path: "requestedBy",
+        select: "firstName lastName position",
+        populate: { path: "userId", select: "email" }
+      })
       .populate("approvedBy", "email")
       .populate("deployedBy", "email");
 
@@ -367,7 +404,11 @@ router.put("/requests/:id/reject", verifyToken, ensureIT, async (req, res) => {
     await request.save();
 
     const populatedRequest = await AssetRequest.findById(request._id)
-      .populate("requestedBy", "firstName lastName position department")
+      .populate({
+        path: "requestedBy",
+        select: "firstName lastName position",
+        populate: { path: "userId", select: "email" }
+      })
       .populate("approvedBy", "email");
 
     res.json({
@@ -437,7 +478,11 @@ router.put("/requests/:id/deploy", verifyToken, ensureIT, async (req, res) => {
     await request.save();
 
     const populatedRequest = await AssetRequest.findById(request._id)
-      .populate("requestedBy", "firstName lastName position department")
+      .populate({
+        path: "requestedBy",
+        select: "firstName lastName position",
+        populate: { path: "userId", select: "email" }
+      })
       .populate("approvedBy", "email")
       .populate("deployedBy", "email")
       .populate("assignedAsset");

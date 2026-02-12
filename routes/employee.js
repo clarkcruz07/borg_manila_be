@@ -91,7 +91,11 @@ router.post("/profile", verifyToken, async (req, res) => {
       !emergencyContactNumber ||
       !position ||
       !company ||
-      !department
+      !dateHired ||
+      !sssNumber ||
+      !philhealthNumber ||
+      !tinNumber ||
+      !pagibigNumber
     ) {
       return res.status(400).json({ error: "All fields are required" });
     }
@@ -112,13 +116,13 @@ router.post("/profile", verifyToken, async (req, res) => {
       employee.emergencyContactNumber = emergencyContactNumber;
       employee.position = position;
       employee.company = company;
-      employee.department = department;
-      employee.dateHired = dateHired || employee.dateHired;
+      employee.department = department || "";
+      employee.dateHired = dateHired;
       if (profilePicture) employee.profilePicture = profilePicture;
-      employee.sssNumber = sssNumber || "";
-      employee.philhealthNumber = philhealthNumber || "";
-      employee.tinNumber = tinNumber || "";
-      employee.pagibigNumber = pagibigNumber || "";
+      employee.sssNumber = sssNumber;
+      employee.philhealthNumber = philhealthNumber;
+      employee.tinNumber = tinNumber;
+      employee.pagibigNumber = pagibigNumber;
 
       // If manager (role = 1) is updating their own profile, keep it approved.
       // Otherwise, reset approval status to pending so a manager can approve.
@@ -147,13 +151,13 @@ router.post("/profile", verifyToken, async (req, res) => {
         emergencyContactNumber,
         position,
         company,
-        department,
+        department: department || "",
         dateHired,
         profilePicture,
-        sssNumber: sssNumber || "",
-        philhealthNumber: philhealthNumber || "",
-        tinNumber: tinNumber || "",
-        pagibigNumber: pagibigNumber || "",
+        sssNumber,
+        philhealthNumber,
+        tinNumber,
+        pagibigNumber,
         // Manager (role = 1) auto-approved, others start as pending
         approval_status: req.user.role === 1 ? 1 : 0,
       });
@@ -163,6 +167,68 @@ router.post("/profile", verifyToken, async (req, res) => {
     res.json({
       message: "Employee profile saved successfully",
       approval_status: employee.approval_status,
+      employee,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update employee profile by ID (Manager/HR only)
+router.put("/profile/:employeeId", verifyToken, ensureCanApprove, async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+    const {
+      firstName,
+      lastName,
+      birthDate,
+      personalEmail,
+      mobileNumber,
+      homeAddress,
+      emergencyContactName,
+      relationship,
+      emergencyContactNumber,
+      position,
+      company,
+      department,
+      dateHired,
+      profilePicture,
+      sssNumber,
+      philhealthNumber,
+      tinNumber,
+      pagibigNumber,
+    } = req.body;
+
+    const employee = await Employee.findById(employeeId).populate("userId");
+    
+    if (!employee) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
+
+    // Update fields if provided
+    if (firstName) employee.firstName = firstName;
+    if (lastName) employee.lastName = lastName;
+    if (birthDate) employee.birthDate = birthDate;
+    if (personalEmail) employee.personalEmail = personalEmail;
+    if (mobileNumber) employee.mobileNumber = mobileNumber;
+    if (homeAddress) employee.homeAddress = homeAddress;
+    if (emergencyContactName) employee.emergencyContactName = emergencyContactName;
+    if (relationship) employee.relationship = relationship;
+    if (emergencyContactNumber) employee.emergencyContactNumber = emergencyContactNumber;
+    if (position) employee.position = position;
+    if (company) employee.company = company;
+    if (department !== undefined) employee.department = department || "";
+    if (dateHired) employee.dateHired = dateHired;
+    if (profilePicture) employee.profilePicture = profilePicture;
+    if (sssNumber) employee.sssNumber = sssNumber;
+    if (philhealthNumber) employee.philhealthNumber = philhealthNumber;
+    if (tinNumber) employee.tinNumber = tinNumber;
+    if (pagibigNumber) employee.pagibigNumber = pagibigNumber;
+
+    await employee.save();
+
+    res.json({
+      message: "Employee profile updated successfully",
       employee,
     });
   } catch (error) {
@@ -185,10 +251,17 @@ router.get("/profile", verifyToken, async (req, res) => {
   }
 });
 
-// Get employee by userId (for viewing a specific employee profile)
-router.get("/profile/:userId", verifyToken, async (req, res) => {
+// Get employee by userId or employeeId (for viewing a specific employee profile)
+router.get("/profile/:id", verifyToken, async (req, res) => {
   try {
-    const employee = await Employee.findOne({ userId: req.params.userId });
+    const { id } = req.params;
+    
+    // Try to find by userId first, then by employee _id
+    let employee = await Employee.findOne({ userId: id });
+    
+    if (!employee) {
+      employee = await Employee.findById(id);
+    }
 
     if (!employee) {
       return res.status(404).json({ error: "Employee profile not found" });

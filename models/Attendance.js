@@ -50,6 +50,10 @@ const attendanceSchema = new mongoose.Schema({
     type: String, // Cloudinary URL
     required: false
   },
+  duration: {
+    type: Number, // Duration in minutes (for clock-out records)
+    required: false
+  },
   ipAddress: String,
   deviceInfo: String
 }, {
