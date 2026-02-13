@@ -420,8 +420,8 @@ router.post("/", verifyToken, async (req, res) => {
         date: extracted?.date ?? null,
       },
       monthYearKey,
-      fileHash: jpgFileHash || null, // Use JPG file hash
-      receiptKey: finalReceiptKey || null,
+      fileHash: jpgFileHash || undefined, // Use JPG file hash when available
+      receiptKey: finalReceiptKey || undefined,
     });
 
     console.log("Receipt saved successfully as JPG:", receipt._id, "at", jpgFilePath);

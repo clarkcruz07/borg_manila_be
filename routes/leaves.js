@@ -6,7 +6,7 @@ const { verifyToken } = require("../middleware/auth");
 const router = express.Router();
 
 // Helper function to calculate leave credits based on hire date
-// 1 credit per month of employment
+// 1 credit per month of employment (per leave type)
 const calculateLeaveCredits = (dateHired) => {
   if (!dateHired) return 0;
   
@@ -49,38 +49,55 @@ router.get("/balance", verifyToken, async (req, res) => {
       return res.status(404).json({ error: "Employee profile not found" });
     }
     
-    // Calculate current leave credits based on hire date
-    const totalCredits = calculateLeaveCredits(employee.dateHired);
+    // Calculate current leave credits based on hire date (per type)
+    const totalCreditsPerType = calculateLeaveCredits(employee.dateHired);
+    
+    // Get used leave credits (approved leaves only), by type
+    const approvedLeaves = await Leave.find({
+      userId: req.user.userId,
+      status: "approved"
+    }).lean();
+    
+    const usedVacationCredits = approvedLeaves.reduce(
+      (sum, leave) => sum + (leave.leaveType === "vacation" ? leave.numberOfDays : 0),
+      0
+    );
+    const usedSickCredits = approvedLeaves.reduce(
+      (sum, leave) => sum + (leave.leaveType === "sick" ? leave.numberOfDays : 0),
+      0
+    );
     
     // Update employee's leave credits if needed
-    if (employee.leaveCredits !== totalCredits) {
-      employee.leaveCredits = totalCredits;
+    const shouldUpdateCredits =
+      employee.vacationCredits !== totalCreditsPerType ||
+      employee.sickCredits !== totalCreditsPerType ||
+      employee.usedVacationCredits !== usedVacationCredits ||
+      employee.usedSickCredits !== usedSickCredits;
+    
+    if (shouldUpdateCredits) {
+      employee.vacationCredits = totalCreditsPerType;
+      employee.sickCredits = totalCreditsPerType;
+      employee.usedVacationCredits = usedVacationCredits;
+      employee.usedSickCredits = usedSickCredits;
       employee.lastLeaveCalculation = new Date();
       await employee.save();
     }
     
-    // Get used leave credits (approved leaves only)
-    const approvedLeaves = await Leave.find({
-      userId: req.user.userId,
-      status: "approved"
-    });
-    
-    const usedCredits = approvedLeaves.reduce((sum, leave) => sum + leave.numberOfDays, 0);
-    
-    // Update used credits
-    if (employee.usedLeaveCredits !== usedCredits) {
-      employee.usedLeaveCredits = usedCredits;
-      await employee.save();
-    }
-    
-    const availableCredits = totalCredits - usedCredits;
-    
     res.json({
-      totalCredits,
-      usedCredits,
-      availableCredits,
+      vacation: {
+        totalCredits: totalCreditsPerType,
+        usedCredits: usedVacationCredits,
+        availableCredits: totalCreditsPerType - usedVacationCredits
+      },
+      sick: {
+        totalCredits: totalCreditsPerType,
+        usedCredits: usedSickCredits,
+        availableCredits: totalCreditsPerType - usedSickCredits
+      },
       dateHired: employee.dateHired,
-      monthsEmployed: calculateLeaveCredits(employee.dateHired)
+      monthsEmployed: totalCreditsPerType,
+      eligibleToUse: totalCreditsPerType >= 6,
+      eligibleAfterMonths: 6
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -94,6 +111,10 @@ router.post("/apply", verifyToken, async (req, res) => {
     
     if (!leaveType || !startDate || !endDate || !reason) {
       return res.status(400).json({ error: "All fields are required" });
+    }
+    
+    if (!["vacation", "sick"].includes(leaveType)) {
+      return res.status(400).json({ error: "Invalid leave type" });
     }
     
     const employee = await Employee.findOne({ userId: req.user.userId });
@@ -112,23 +133,7 @@ router.post("/apply", verifyToken, async (req, res) => {
     
     const numberOfDays = calculateBusinessDays(start, end);
     
-    // Check if user has enough leave credits
-    const totalCredits = calculateLeaveCredits(employee.dateHired);
-    const usedCredits = employee.usedLeaveCredits || 0;
-    const availableCredits = totalCredits - usedCredits;
-    
-    // Count pending leaves
-    const pendingLeaves = await Leave.find({
-      userId: req.user.userId,
-      status: "pending"
-    });
-    const pendingDays = pendingLeaves.reduce((sum, leave) => sum + leave.numberOfDays, 0);
-    
-    if (numberOfDays + pendingDays > availableCredits) {
-      return res.status(400).json({ 
-        error: `Insufficient leave credits. Available: ${availableCredits}, Requested: ${numberOfDays}, Pending: ${pendingDays}` 
-      });
-    }
+    // Leave can be filed even if credits are insufficient or before 6th month
     
     // Check for overlapping leaves
     const overlapping = await Leave.findOne({
@@ -164,7 +169,11 @@ router.post("/apply", verifyToken, async (req, res) => {
     
     // If auto-approved (Manager), update used credits immediately
     if (initialStatus === "approved") {
-      employee.usedLeaveCredits = usedCredits + numberOfDays;
+      if (leaveType === "vacation") {
+        employee.usedVacationCredits = (employee.usedVacationCredits || 0) + numberOfDays;
+      } else if (leaveType === "sick") {
+        employee.usedSickCredits = (employee.usedSickCredits || 0) + numberOfDays;
+      }
       leave.approvedBy = req.user.userId;
       leave.approvedAt = new Date();
       await employee.save();
@@ -295,21 +304,14 @@ router.patch("/:leaveId/status", verifyToken, async (req, res) => {
       return res.status(400).json({ error: "Leave application has already been processed" });
     }
     
-    // If approving, check if employee still has enough credits
+    // If approving, update employee's used credits by type
     if (status === "approved") {
       const employee = leave.employeeId;
-      const totalCredits = calculateLeaveCredits(employee.dateHired);
-      const usedCredits = employee.usedLeaveCredits || 0;
-      const availableCredits = totalCredits - usedCredits;
-      
-      if (leave.numberOfDays > availableCredits) {
-        return res.status(400).json({ 
-          error: `Employee has insufficient leave credits. Available: ${availableCredits}, Requested: ${leave.numberOfDays}` 
-        });
+      if (leave.leaveType === "vacation") {
+        employee.usedVacationCredits = (employee.usedVacationCredits || 0) + leave.numberOfDays;
+      } else if (leave.leaveType === "sick") {
+        employee.usedSickCredits = (employee.usedSickCredits || 0) + leave.numberOfDays;
       }
-      
-      // Update employee's used credits
-      employee.usedLeaveCredits = usedCredits + leave.numberOfDays;
       await employee.save();
     }
     

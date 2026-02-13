@@ -103,12 +103,20 @@ const employeeSchema = new mongoose.Schema(
         message: 'Pag-IBIG Number must follow format XXXX-XXXX-XXXX'
       }
     },
-    // Leave Credits (1 per month from hire date)
-    leaveCredits: {
+    // Leave Credits (1 per month from hire date, per leave type)
+    vacationCredits: {
       type: Number,
       default: 0,
     },
-    usedLeaveCredits: {
+    sickCredits: {
+      type: Number,
+      default: 0,
+    },
+    usedVacationCredits: {
+      type: Number,
+      default: 0,
+    },
+    usedSickCredits: {
       type: Number,
       default: 0,
     },

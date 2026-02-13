@@ -33,22 +33,39 @@ const receiptSchema = new mongoose.Schema(
     // SHA-256 hash of the uploaded file for exact duplicate detection
     fileHash: {
       type: String,
-      default: null,
+      default: undefined,
       index: true,
     },
     // Fingerprint based on extracted receipt data (TIN + date + amount + shop) for same-receipt detection
     receiptKey: {
       type: String,
-      default: null,
+      default: undefined,
       index: true,
     },
   },
   { timestamps: true }
 );
 
-// Compound index to prevent duplicate receipts per user
-receiptSchema.index({ userId: 1, receiptKey: 1 }, { unique: true });
-receiptSchema.index({ userId: 1, fileHash: 1 }, { unique: true });
+// Compound indexes to prevent duplicates per user.
+// Partial filters avoid false duplicate conflicts when key/hash is missing.
+receiptSchema.index(
+  { userId: 1, receiptKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      receiptKey: { $exists: true, $type: "string" },
+    },
+  }
+);
+receiptSchema.index(
+  { userId: 1, fileHash: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      fileHash: { $exists: true, $type: "string" },
+    },
+  }
+);
 
 module.exports = mongoose.model("Receipt", receiptSchema);
 
