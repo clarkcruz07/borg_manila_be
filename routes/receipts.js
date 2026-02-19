@@ -13,7 +13,9 @@ const { cleanExtractedData } = require("../services/textCleaner");
 const { cloudinary, USE_CLOUDINARY } = require("../config/cloudinary");
 
 const router = express.Router();
-const upload = multer({ dest: "uploads/" });
+const upload = multer({
+  dest: process.env.VERCEL ? "/tmp/uploads/" : "uploads/",
+});
 
 function normalizeMonthYearKey(dateStr) {
   if (!dateStr || typeof dateStr !== "string") return null;

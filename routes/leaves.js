@@ -40,6 +40,72 @@ const calculateBusinessDays = (startDate, endDate) => {
   return count;
 };
 
+// Recompute leave credits for employees from approved leave records.
+// This keeps employee_details leave fields consistent with source-of-truth Leave data.
+const syncEmployeeLeaveCredits = async () => {
+  const employees = await Employee.find({}).select(
+    "_id userId dateHired vacationCredits sickCredits usedVacationCredits usedSickCredits"
+  );
+
+  if (!employees.length) return;
+
+  const userIds = employees.map((emp) => emp.userId).filter(Boolean);
+  const approvedLeaves = await Leave.find({
+    userId: { $in: userIds },
+    status: "approved",
+  })
+    .select("userId leaveType numberOfDays")
+    .lean();
+
+  const usedByUserId = new Map();
+  approvedLeaves.forEach((leave) => {
+    const userKey = String(leave.userId);
+    if (!usedByUserId.has(userKey)) {
+      usedByUserId.set(userKey, { vacation: 0, sick: 0 });
+    }
+    const totals = usedByUserId.get(userKey);
+    const days = Number(leave.numberOfDays) || 0;
+    if (leave.leaveType === "vacation") totals.vacation += days;
+    if (leave.leaveType === "sick") totals.sick += days;
+  });
+
+  const updates = [];
+  const now = new Date();
+
+  employees.forEach((employee) => {
+    const userKey = String(employee.userId);
+    const used = usedByUserId.get(userKey) || { vacation: 0, sick: 0 };
+    const totalCreditsPerType = calculateLeaveCredits(employee.dateHired);
+
+    const shouldUpdate =
+      employee.vacationCredits !== totalCreditsPerType ||
+      employee.sickCredits !== totalCreditsPerType ||
+      employee.usedVacationCredits !== used.vacation ||
+      employee.usedSickCredits !== used.sick;
+
+    if (shouldUpdate) {
+      updates.push({
+        updateOne: {
+          filter: { _id: employee._id },
+          update: {
+            $set: {
+              vacationCredits: totalCreditsPerType,
+              sickCredits: totalCreditsPerType,
+              usedVacationCredits: used.vacation,
+              usedSickCredits: used.sick,
+              lastLeaveCalculation: now,
+            },
+          },
+        },
+      });
+    }
+  });
+
+  if (updates.length) {
+    await Employee.bulkWrite(updates);
+  }
+};
+
 // Get leave balance for current user
 router.get("/balance", verifyToken, async (req, res) => {
   try {
@@ -393,6 +459,98 @@ router.get("/all", verifyToken, async (req, res) => {
       .sort({ createdAt: -1 });
     
     res.json(leaves);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Leaves monitor summary (for managers/HR)
+// Returns per-employee totals by leave type and grand totals.
+router.get("/monitor-summary", verifyToken, async (req, res) => {
+  try {
+    const role = req.user.role;
+    if (role !== 1 && role !== 2) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    // Keep employee leave credit fields synced from approved leave data.
+    await syncEmployeeLeaveCredits();
+
+    const { status } = req.query;
+    const leaveQuery = {};
+    if (status && status !== "all") {
+      leaveQuery.status = status;
+    }
+
+    const [employees, leaves] = await Promise.all([
+      Employee.find({}).select(
+        "userId firstName lastName position department vacationCredits sickCredits"
+      ),
+      Leave.find(leaveQuery).select("userId employeeId leaveType numberOfDays").lean(),
+    ]);
+
+    const rowsByEmployeeId = new Map();
+    const employeeIdByUserId = new Map();
+
+    employees.forEach((employee) => {
+      const employeeId = String(employee._id);
+      const userId = employee.userId ? String(employee.userId) : null;
+      rowsByEmployeeId.set(employeeId, {
+        employeeId,
+        userId,
+        fullName: `${employee.firstName || ""} ${employee.lastName || ""}`.trim() || "Unknown",
+        position: employee.position || "N/A",
+        department: employee.department || "N/A",
+        leaveCredits: Math.max(
+          Number(employee.vacationCredits) || 0,
+          Number(employee.sickCredits) || 0
+        ),
+        vacation: employee.vacationCredits || 0,
+        sick: employee.sickCredits,
+        total: 0,
+      });
+      if (userId) employeeIdByUserId.set(userId, employeeId);
+    });
+
+    leaves.forEach((leave) => {
+      const leaveEmployeeId = leave.employeeId ? String(leave.employeeId) : null;
+      const leaveUserId = leave.userId ? String(leave.userId) : null;
+      const resolvedEmployeeId =
+        (leaveEmployeeId && rowsByEmployeeId.has(leaveEmployeeId) && leaveEmployeeId) ||
+        (leaveUserId && employeeIdByUserId.get(leaveUserId)) ||
+        null;
+
+      if (!resolvedEmployeeId) return;
+
+      const row = rowsByEmployeeId.get(resolvedEmployeeId);
+      const days = Number(leave.numberOfDays) || 0;
+      if (leave.leaveType === "vacation") row.vacation += days;
+      if (leave.leaveType === "sick") row.sick += days;
+      row.total += days;
+    });
+
+    const rows = Array.from(rowsByEmployeeId.values()).sort((a, b) => {
+      if (b.total !== a.total) return b.total - a.total;
+      return a.fullName.localeCompare(b.fullName);
+    });
+
+    const grandTotals = rows.reduce(
+      (acc, row) => {
+        acc.vacation += row.vacation;
+        acc.sick += row.sick;
+        acc.total += row.total;
+        return acc;
+      },
+      { vacation: 0, sick: 0, total: 0 }
+    );
+
+    res.json({
+      rows,
+      grandTotals,
+      totalEmployees: rows.length,
+      statusFilter: status || "all",
+      syncedAt: new Date(),
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
