@@ -254,6 +254,11 @@ router.delete("/jobs/:jobId", verifyToken, async (req, res) => {
 // Get job status by job ID
 router.get("/jobs/:jobId", verifyToken, async (req, res) => {
   try {
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+    res.set("Surrogate-Control", "no-store");
+
     const job = await Job.findOne({
       _id: req.params.jobId,
       userId: req.user.userId // Ensure user can only access their own jobs

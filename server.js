@@ -13,6 +13,8 @@ const assetRoutes = require("./routes/assets");
 const sampleRoutes = require("./routes/sample");
 
 const app = express();
+// Disable ETag so job status polling always returns a fresh JSON payload (avoid 304 loops).
+app.set("etag", false);
 app.use(cors());
 app.use(express.json({ limit: '10mb' })); // Increase limit for base64 images
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
