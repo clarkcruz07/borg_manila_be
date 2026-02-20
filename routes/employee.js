@@ -1,9 +1,30 @@
+
 const express = require("express");
 const Employee = require("../models/Employee");
 const Department = require("../models/Department");
 const { verifyToken } = require("../middleware/auth");
 
 const router = express.Router();
+
+// PATCH: Set leaveCreditsMode for an employee (HR/Manager only)
+router.patch('/:employeeId/leave-mode', verifyToken, ensureCanApprove, async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+    const { mode } = req.body;
+    if (!['auto', 'manual'].includes(mode)) {
+      return res.status(400).json({ error: 'Invalid mode' });
+    }
+    const employee = await Employee.findById(employeeId);
+    if (!employee) {
+      return res.status(404).json({ error: 'Employee not found' });
+    }
+    employee.leaveCreditsMode = mode;
+    await employee.save();
+    res.json({ message: `Leave credits mode set to ${mode}`, employee });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // Helper middleware: only allow HR (2) or Manager (1) to access approval routes
 function ensureCanApprove(req, res, next) {
@@ -104,6 +125,14 @@ router.post("/profile", verifyToken, async (req, res) => {
     let employee = await Employee.findOne({ userId: req.user.userId });
 
     if (employee) {
+      // Existing profiles can only be edited when currently approved.
+      // Manager (role 1) remains exempt because manager edits are auto-approved.
+      if (req.user.role !== 1 && employee.approval_status !== 1) {
+        return res.status(403).json({
+          error: "Profile cannot be edited while pending or rejected. Wait for approval first.",
+        });
+      }
+
       // Update existing profile
       employee.firstName = firstName;
       employee.lastName = lastName;
@@ -124,8 +153,8 @@ router.post("/profile", verifyToken, async (req, res) => {
       employee.tinNumber = tinNumber;
       employee.pagibigNumber = pagibigNumber;
 
-      // If manager (role = 1) is updating their own profile, keep it approved.
-      // Otherwise, reset approval status to pending so a manager can approve.
+      // Role 1 (Manager) edits are auto-approved.
+      // Other roles must re-enter approval after any profile edit.
       if (req.user.role === 1) {
         employee.approval_status = 1;
       } else {
@@ -395,7 +424,10 @@ router.get("/", verifyToken, async (req, res) => {
   }
 });
 
-// Update profile picture only (doesn't affect approval status)
+// Update profile picture only.
+// This follows the same approval workflow as full profile edits:
+// - Role 1 auto-approved
+// - Others require current profile to be approved first, then move to pending.
 router.patch("/profile/picture", verifyToken, async (req, res) => {
   try {
     const { profilePicture } = req.body;
@@ -410,13 +442,25 @@ router.patch("/profile/picture", verifyToken, async (req, res) => {
       return res.status(404).json({ error: "Employee profile not found" });
     }
 
-    // Update only the profile picture, don't change approval status
+    if (req.user.role !== 1 && employee.approval_status !== 1) {
+      return res.status(403).json({
+        error: "Profile cannot be edited while pending or rejected. Wait for approval first.",
+      });
+    }
+
     employee.profilePicture = profilePicture;
+    if (req.user.role === 1) {
+      employee.approval_status = 1;
+    } else {
+      employee.approval_status = 0;
+      employee.rejectionReason = undefined;
+    }
     employee.updatedAt = Date.now();
 
     await employee.save();
     res.json({
       message: "Profile picture updated successfully",
+      approval_status: employee.approval_status,
       employee,
     });
   } catch (error) {

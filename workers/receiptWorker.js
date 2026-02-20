@@ -25,6 +25,62 @@ const CONCURRENT_JOBS = 2; // Process 2 jobs at a time
 let isProcessing = false;
 let processingCount = 0;
 
+function safeUnlink(filePath) {
+  try {
+    if (filePath && fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      return true;
+    }
+  } catch (err) {
+    console.error(`  ✗ Failed to delete local file ${filePath}:`, err.message);
+  }
+  return false;
+}
+
+function extractCloudinaryPublicIdFromUrl(url) {
+  if (!url || typeof url !== "string") return null;
+  try {
+    const decodedUrl = decodeURIComponent(url);
+    const urlParts = decodedUrl.split("/");
+    const fileWithExtension = urlParts[urlParts.length - 1];
+    const fileName = fileWithExtension.split(".")[0];
+    const uploadIndex = urlParts.indexOf("upload");
+    if (uploadIndex < 0) return null;
+
+    let startIndex = uploadIndex + 1;
+    if (urlParts[startIndex] && /^v\d+$/.test(urlParts[startIndex])) {
+      startIndex++;
+    }
+
+    const folderParts = urlParts.slice(startIndex, -1);
+    return [...folderParts, fileName].join("/");
+  } catch (err) {
+    console.error("  ✗ Failed to parse Cloudinary public ID:", err.message);
+    return null;
+  }
+}
+
+async function deleteCloudinaryByUrl(url, label = "Cloudinary file") {
+  if (!USE_CLOUDINARY || !url) return;
+  try {
+    const publicId = extractCloudinaryPublicIdFromUrl(url);
+    if (!publicId) {
+      console.warn(`  ⚠️  Could not derive public_id for ${label}`);
+      return;
+    }
+    const result = await cloudinary.uploader.destroy(publicId);
+    console.log(`  ✓ Deleted ${label} from Cloudinary: ${result.result}`);
+  } catch (err) {
+    console.error(`  ✗ Failed deleting ${label} from Cloudinary:`, err.message);
+  }
+}
+
+function hasValue(value) {
+  if (value === null || value === undefined) return false;
+  const normalized = String(value).trim().toLowerCase();
+  return normalized !== "" && normalized !== "null" && normalized !== "undefined" && normalized !== "n/a";
+}
+
 async function connectDB() {
   try {
     await mongoose.connect(MONGO_URI);
@@ -186,6 +242,35 @@ async function processJob(job) {
       date: cleanedExtracted.date
     });
 
+    // Hard-stop invalid extraction: date and amount are required for reimbursement workflows.
+    const missingFields = [];
+    if (!hasValue(cleanedExtracted.date)) missingFields.push("date");
+    if (!hasValue(cleanedExtracted.amountDue)) missingFields.push("amountDue");
+
+    if (missingFields.length > 0) {
+      const missingLabel = missingFields.join(", ");
+      const errorMessage = `Required receipt fields not found (${missingLabel}). File deleted. Please re-upload this receipt.`;
+      console.warn(`  ⚠️  ${errorMessage}`);
+
+      // Remove Cloudinary pending asset for this job (if any).
+      if (job.cloudinaryUrl) {
+        await deleteCloudinaryByUrl(job.cloudinaryUrl, "pending receipt");
+      } else if (job.filePath && (job.filePath.startsWith("http://") || job.filePath.startsWith("https://"))) {
+        await deleteCloudinaryByUrl(job.filePath, "receipt");
+      }
+
+      // Remove local temp/downloaded files.
+      safeUnlink(tempDownloadedFile);
+      if (job.filePath && !job.filePath.startsWith("http://") && !job.filePath.startsWith("https://")) {
+        safeUnlink(job.filePath);
+      }
+
+      // Delete the job so client gets re-upload prompt.
+      await Job.deleteOne({ _id: job._id });
+      console.log(`  ✓ Deleted job ${job._id} after missing required fields`);
+      return;
+    }
+
     // Upload to Cloudinary with date-based folder structure
     let cloudinaryUrl = job.cloudinaryUrl; // Start with existing URL (from pending folder)
     let finalFilePath = job.filePath;
@@ -281,13 +366,9 @@ async function processJob(job) {
         }
 
         // Clean up compressed temp file
-        if (fs.existsSync(compressedPath)) {
-          fs.unlinkSync(compressedPath);
-        }
+        safeUnlink(compressedPath);
         // Clean up temp downloaded file if it exists
-        if (tempDownloadedFile && fs.existsSync(tempDownloadedFile)) {
-          fs.unlinkSync(tempDownloadedFile);
-        }
+        safeUnlink(tempDownloadedFile);
         console.log(`  [+${Date.now() - startTime}ms] ✓ Local temp files cleaned up`);
       } catch (cloudinaryError) {
         console.error("  ✗ Cloudinary upload failed:", cloudinaryError);
@@ -317,8 +398,7 @@ async function processJob(job) {
     console.log(`  [+${Date.now() - startTime}ms] ✓ Job ${job._id} completed successfully in ${totalTime}s (${completeResult.modifiedCount} document updated)`);
     
     // Clean up temp downloaded file if it exists
-    if (tempDownloadedFile && fs.existsSync(tempDownloadedFile)) {
-      fs.unlinkSync(tempDownloadedFile);
+    if (safeUnlink(tempDownloadedFile)) {
       console.log("  ✓ Temp file cleaned up");
     }
     
@@ -328,13 +408,8 @@ async function processJob(job) {
     console.error(`  ✗ Error stack:`, error.stack);
     
     // Clean up temp downloaded file if it exists
-    if (tempDownloadedFile && fs.existsSync(tempDownloadedFile)) {
-      try {
-        fs.unlinkSync(tempDownloadedFile);
-        console.log("  ✓ Temp file cleaned up after error");
-      } catch (cleanupErr) {
-        console.error("  ✗ Failed to clean up temp file:", cleanupErr);
-      }
+    if (safeUnlink(tempDownloadedFile)) {
+      console.log("  ✓ Temp file cleaned up after error");
     }
     
     // Check if we should retry
@@ -360,9 +435,7 @@ async function processJob(job) {
       
       // Clean up file on permanent failure (only if local file, not Cloudinary URL)
       if (job.filePath && !job.filePath.startsWith('http://') && !job.filePath.startsWith('https://')) {
-        if (fs.existsSync(job.filePath)) {
-          fs.unlinkSync(job.filePath);
-        }
+        safeUnlink(job.filePath);
       }
     }
   }

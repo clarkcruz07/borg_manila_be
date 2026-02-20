@@ -121,6 +121,12 @@ const employeeSchema = new mongoose.Schema(
       default: 0,
     },
     lastLeaveCalculation: {
+          // Leave Credits Mode: 'auto' (default) or 'manual' (set by HR/Manager)
+          leaveCreditsMode: {
+            type: String,
+            enum: ['auto', 'manual'],
+            default: 'auto',
+          },
       type: Date,
       required: false,
     },

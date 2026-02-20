@@ -5,6 +5,78 @@ const { verifyToken } = require("../middleware/auth");
 
 const router = express.Router();
 
+// Apply for leave (file a leave application)
+router.post("/apply", verifyToken, async (req, res) => {
+  try {
+    const { leaveType, startDate, endDate, reason, attachments } = req.body;
+
+    const employee = await Employee.findOne({ userId: req.user.userId });
+    if (!employee) {
+      return res.status(404).json({ error: "Employee profile not found" });
+    }
+
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    const numberOfDays = calculateBusinessDays(start, end);
+
+    // Calculate months of tenure
+    const hireDate = new Date(employee.dateHired);
+    const now = new Date();
+    const yearsDiff = now.getFullYear() - hireDate.getFullYear();
+    const monthsDiff = now.getMonth() - hireDate.getMonth();
+    const totalMonths = yearsDiff * 12 + monthsDiff;
+    const hasSixMonths = totalMonths >= 6;
+
+    // Role 1 (Manager) - Auto-approved
+    // Role 2 (HR) and Role 3 (Employee) - Pending
+    const userRole = req.user.role;
+    const initialStatus = userRole === 1 ? "approved" : "pending";
+
+    // If less than 6 months, do not deduct credits yet
+    let pendingDeduction = false;
+    if (!hasSixMonths) {
+      pendingDeduction = true;
+    }
+
+    const leave = new Leave({
+      userId: req.user.userId,
+      employeeId: employee._id,
+      leaveType,
+      startDate: start,
+      endDate: end,
+      numberOfDays,
+      reason,
+      attachments: attachments || [],
+      status: initialStatus,
+      pendingDeduction, // custom field to track if deduction is pending
+    });
+
+    // Only deduct credits if 6+ months and auto-approved
+    if (initialStatus === "approved" && hasSixMonths) {
+      if (leaveType === "vacation") {
+        employee.vacationCredits = Math.max(0, (employee.vacationCredits || 0) - numberOfDays);
+      } else if (leaveType === "sick") {
+        employee.sickCredits = Math.max(0, (employee.sickCredits || 0) - numberOfDays);
+      }
+      leave.approvedBy = req.user.userId;
+      leave.approvedAt = new Date();
+      await employee.save();
+    }
+
+    await leave.save();
+
+    return res.status(201).json({
+      message: initialStatus === "approved"
+        ? (hasSixMonths ? "Leave automatically approved" : "Leave approved, deduction pending 6th month")
+        : (hasSixMonths ? "Leave application submitted successfully" : "Leave filed, deduction pending 6th month"),
+      leave,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+
 // Helper function to calculate leave credits based on hire date
 // 1 credit per month of employment (per leave type)
 const calculateLeaveCredits = (dateHired) => {
@@ -109,118 +181,22 @@ const syncEmployeeLeaveCredits = async () => {
 // Get leave balance for current user
 router.get("/balance", verifyToken, async (req, res) => {
   try {
-    const employee = await Employee.findOne({ userId: req.user.userId });
-    
-    if (!employee) {
-      return res.status(404).json({ error: "Employee profile not found" });
-    }
-    
-    // Calculate current leave credits based on hire date (per type)
-    const totalCreditsPerType = calculateLeaveCredits(employee.dateHired);
-    
-    // Get used leave credits (approved leaves only), by type
-    const approvedLeaves = await Leave.find({
-      userId: req.user.userId,
-      status: "approved"
-    }).lean();
-    
-    const usedVacationCredits = approvedLeaves.reduce(
-      (sum, leave) => sum + (leave.leaveType === "vacation" ? leave.numberOfDays : 0),
-      0
-    );
-    const usedSickCredits = approvedLeaves.reduce(
-      (sum, leave) => sum + (leave.leaveType === "sick" ? leave.numberOfDays : 0),
-      0
-    );
-    
-    // Update employee's leave credits if needed
-    const shouldUpdateCredits =
-      employee.vacationCredits !== totalCreditsPerType ||
-      employee.sickCredits !== totalCreditsPerType ||
-      employee.usedVacationCredits !== usedVacationCredits ||
-      employee.usedSickCredits !== usedSickCredits;
-    
-    if (shouldUpdateCredits) {
-      employee.vacationCredits = totalCreditsPerType;
-      employee.sickCredits = totalCreditsPerType;
-      employee.usedVacationCredits = usedVacationCredits;
-      employee.usedSickCredits = usedSickCredits;
-      employee.lastLeaveCalculation = new Date();
-      await employee.save();
-    }
-    
-    res.json({
-      vacation: {
-        totalCredits: totalCreditsPerType,
-        usedCredits: usedVacationCredits,
-        availableCredits: totalCreditsPerType - usedVacationCredits
-      },
-      sick: {
-        totalCredits: totalCreditsPerType,
-        usedCredits: usedSickCredits,
-        availableCredits: totalCreditsPerType - usedSickCredits
-      },
-      dateHired: employee.dateHired,
-      monthsEmployed: totalCreditsPerType,
-      eligibleToUse: totalCreditsPerType >= 6,
-      eligibleAfterMonths: 6
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Apply for leave
-router.post("/apply", verifyToken, async (req, res) => {
-  try {
     const { leaveType, startDate, endDate, reason, attachments } = req.body;
-    
-    if (!leaveType || !startDate || !endDate || !reason) {
-      return res.status(400).json({ error: "All fields are required" });
-    }
-    
-    if (!["vacation", "sick"].includes(leaveType)) {
-      return res.status(400).json({ error: "Invalid leave type" });
-    }
-    
+
     const employee = await Employee.findOne({ userId: req.user.userId });
-    
     if (!employee) {
       return res.status(404).json({ error: "Employee profile not found" });
     }
-    
-    // Calculate number of days
+
     const start = new Date(startDate);
     const end = new Date(endDate);
-    
-    if (end < start) {
-      return res.status(400).json({ error: "End date must be after start date" });
-    }
-    
     const numberOfDays = calculateBusinessDays(start, end);
-    
-    // Leave can be filed even if credits are insufficient or before 6th month
-    
-    // Check for overlapping leaves
-    const overlapping = await Leave.findOne({
-      userId: req.user.userId,
-      status: { $in: ["pending", "approved"] },
-      $or: [
-        { startDate: { $lte: end }, endDate: { $gte: start } }
-      ]
-    });
-    
-    if (overlapping) {
-      return res.status(400).json({ error: "You have overlapping leave dates" });
-    }
-    
-    // Determine initial status based on role
+
     // Role 1 (Manager) - Auto-approved
     // Role 2 (HR) and Role 3 (Employee) - Pending
     const userRole = req.user.role;
     const initialStatus = userRole === 1 ? "approved" : "pending";
-    
-    // Create leave application
+
     const leave = new Leave({
       userId: req.user.userId,
       employeeId: employee._id,
@@ -230,10 +206,9 @@ router.post("/apply", verifyToken, async (req, res) => {
       numberOfDays,
       reason,
       attachments: attachments || [],
-      status: initialStatus
+      status: initialStatus,
     });
-    
-    // If auto-approved (Manager), update used credits immediately
+
     if (initialStatus === "approved") {
       if (leaveType === "vacation") {
         employee.usedVacationCredits = (employee.usedVacationCredits || 0) + numberOfDays;
@@ -242,19 +217,19 @@ router.post("/apply", verifyToken, async (req, res) => {
       }
       leave.approvedBy = req.user.userId;
       leave.approvedAt = new Date();
-      await employee.save();
+      await employee.save(); // ✅ now valid
     }
-    
+
     await leave.save();
-    
-    res.status(201).json({
-      message: initialStatus === "approved" 
-        ? "Leave automatically approved" 
+
+    return res.status(201).json({
+      message: initialStatus === "approved"
+        ? "Leave automatically approved"
         : "Leave application submitted successfully",
-      leave
+      leave,
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 });
 
@@ -370,15 +345,30 @@ router.patch("/:leaveId/status", verifyToken, async (req, res) => {
       return res.status(400).json({ error: "Leave application has already been processed" });
     }
     
-    // If approving, update employee's used credits by type
+    // If approving, directly subtract from available credits
     if (status === "approved") {
       const employee = leave.employeeId;
-      if (leave.leaveType === "vacation") {
-        employee.usedVacationCredits = (employee.usedVacationCredits || 0) + leave.numberOfDays;
-      } else if (leave.leaveType === "sick") {
-        employee.usedSickCredits = (employee.usedSickCredits || 0) + leave.numberOfDays;
+      let shouldDeduct = true;
+      if (leave.pendingDeduction) {
+        // Check if employee now has 6+ months tenure
+        const hireDate = new Date(employee.dateHired);
+        const now = new Date();
+        const yearsDiff = now.getFullYear() - hireDate.getFullYear();
+        const monthsDiff = now.getMonth() - hireDate.getMonth();
+        const totalMonths = yearsDiff * 12 + monthsDiff;
+        shouldDeduct = totalMonths >= 6;
+        if (shouldDeduct) {
+          leave.pendingDeduction = false;
+        }
       }
-      await employee.save();
+      if (shouldDeduct) {
+        if (leave.leaveType === "vacation") {
+          employee.vacationCredits = Math.max(0, (employee.vacationCredits || 0) - leave.numberOfDays);
+        } else if (leave.leaveType === "sick") {
+          employee.sickCredits = Math.max(0, (employee.sickCredits || 0) - leave.numberOfDays);
+        }
+        await employee.save();
+      }
     }
     
     leave.status = status;
@@ -473,24 +463,13 @@ router.get("/monitor-summary", verifyToken, async (req, res) => {
       return res.status(403).json({ error: "Access denied" });
     }
 
-    // Keep employee leave credit fields synced from approved leave data.
-    await syncEmployeeLeaveCredits();
 
     const { status } = req.query;
-    const leaveQuery = {};
-    if (status && status !== "all") {
-      leaveQuery.status = status;
-    }
-
-    const [employees, leaves] = await Promise.all([
-      Employee.find({}).select(
-        "userId firstName lastName position department vacationCredits sickCredits"
-      ),
-      Leave.find(leaveQuery).select("userId employeeId leaveType numberOfDays").lean(),
-    ]);
+    const employees = await Employee.find({}).select(
+      "userId firstName lastName position department vacationCredits sickCredits leaveCreditsMode"
+    );
 
     const rowsByEmployeeId = new Map();
-    const employeeIdByUserId = new Map();
 
     employees.forEach((employee) => {
       const employeeId = String(employee._id);
@@ -501,38 +480,21 @@ router.get("/monitor-summary", verifyToken, async (req, res) => {
         fullName: `${employee.firstName || ""} ${employee.lastName || ""}`.trim() || "Unknown",
         position: employee.position || "N/A",
         department: employee.department || "N/A",
-        leaveCredits: Math.max(
-          Number(employee.vacationCredits) || 0,
-          Number(employee.sickCredits) || 0
-        ),
-        vacation: employee.vacationCredits || 0,
-        sick: employee.sickCredits,
-        total: 0,
+        leaveCredits:
+          (Number(employee.vacationCredits) || 0) +
+          (Number(employee.sickCredits) || 0),
+        vacation: Number(employee.vacationCredits) || 0,
+        sick: Number(employee.sickCredits) || 0,
+        total:
+          (Number(employee.vacationCredits) || 0) +
+          (Number(employee.sickCredits) || 0),
+        leaveCreditsMode: employee.leaveCreditsMode || "auto",
       });
-      if (userId) employeeIdByUserId.set(userId, employeeId);
     });
 
-    leaves.forEach((leave) => {
-      const leaveEmployeeId = leave.employeeId ? String(leave.employeeId) : null;
-      const leaveUserId = leave.userId ? String(leave.userId) : null;
-      const resolvedEmployeeId =
-        (leaveEmployeeId && rowsByEmployeeId.has(leaveEmployeeId) && leaveEmployeeId) ||
-        (leaveUserId && employeeIdByUserId.get(leaveUserId)) ||
-        null;
-
-      if (!resolvedEmployeeId) return;
-
-      const row = rowsByEmployeeId.get(resolvedEmployeeId);
-      const days = Number(leave.numberOfDays) || 0;
-      if (leave.leaveType === "vacation") row.vacation += days;
-      if (leave.leaveType === "sick") row.sick += days;
-      row.total += days;
-    });
-
-    const rows = Array.from(rowsByEmployeeId.values()).sort((a, b) => {
-      if (b.total !== a.total) return b.total - a.total;
-      return a.fullName.localeCompare(b.fullName);
-    });
+    const rows = Array.from(rowsByEmployeeId.values()).sort((a, b) =>
+      a.fullName.localeCompare(b.fullName)
+    );
 
     const grandTotals = rows.reduce(
       (acc, row) => {
@@ -551,6 +513,32 @@ router.get("/monitor-summary", verifyToken, async (req, res) => {
       statusFilter: status || "all",
       syncedAt: new Date(),
     });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update leave credits for an employee (HR/Manager only)
+router.post("/update-credits", verifyToken, async (req, res) => {
+  try {
+    const role = req.user.role;
+    if (role !== 1 && role !== 2) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+    const { rowId, vacation, sick } = req.body;
+    if (!rowId || vacation == null || sick == null) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+    const employee = await Employee.findById(rowId);
+    if (!employee) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
+      employee.vacationCredits = Number(vacation);
+      employee.sickCredits = Number(sick);
+      employee.leaveCreditsMode = 'manual';
+      employee.lastLeaveCalculation = new Date();
+      await employee.save();
+      res.json({ message: "Leave credits updated successfully", employee });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
