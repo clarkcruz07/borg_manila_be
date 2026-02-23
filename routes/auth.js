@@ -102,6 +102,37 @@ router.post("/login", async (req, res) => {
   }
 });
 
+// Forgot password - verify email and issue short-lived reset token
+router.post("/forgot-password/verify", async (req, res) => {
+  try {
+    const email = req.body?.email?.trim().toLowerCase();
+
+    if (!email) {
+      return res.status(400).json({ error: "Email is required" });
+    }
+
+    const user = await User.findOne({ email }).select("_id email");
+    if (!user) {
+      return res.status(404).json({ error: "Email not found" });
+    }
+
+    const resetToken = jwt.sign(
+      { userId: user._id, email: user.email, purpose: "forgot-password" },
+      JWT_SECRET,
+      { expiresIn: "15m" }
+    );
+
+    res.json({
+      message: "Email verified",
+      userId: user._id,
+      resetToken,
+    });
+  } catch (error) {
+    console.error("Forgot password verify error:", error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
 // Change password (on first login)
 router.post("/change-password", async (req, res) => {
   try {
@@ -138,6 +169,51 @@ router.post("/change-password", async (req, res) => {
     res.json({ message: "Password changed successfully" });
   } catch (error) {
     console.error("Password change error:", error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Forgot password - change password using short-lived reset token
+router.post("/forgot-password/change", async (req, res) => {
+  try {
+    const { userId, newPassword, resetToken } = req.body;
+
+    if (!userId || !newPassword || !resetToken) {
+      return res.status(400).json({ error: "User ID, new password, and reset token are required" });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: "Password must be at least 6 characters" });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(resetToken, JWT_SECRET);
+    } catch {
+      return res.status(401).json({ error: "Invalid or expired reset token" });
+    }
+
+    if (decoded.purpose !== "forgot-password") {
+      return res.status(401).json({ error: "Invalid reset token purpose" });
+    }
+
+    if (decoded.userId !== userId) {
+      return res.status(401).json({ error: "Reset token does not match user" });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    user.password = newPassword;
+    user.passwordChanged = true;
+    user.passwordChangedAt = new Date();
+    await user.save();
+
+    res.json({ message: "Password reset successfully" });
+  } catch (error) {
+    console.error("Forgot password change error:", error);
     res.status(400).json({ error: error.message });
   }
 });
